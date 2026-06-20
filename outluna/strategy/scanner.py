@@ -1,7 +1,6 @@
 """全市场扫描器。"""
 
 from datetime import datetime, timedelta
-from typing import Any
 
 import pandas as pd
 

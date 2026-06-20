@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>OutLuna 报告 - {{ report_id }}</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; margin: 2rem; background: #f8f9fa; color: #333; }
+        .container { max-width: 960px; margin: 0 auto; background: #fff; padding: 2rem; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); }
+        h1 { font-size: 1.5rem; border-bottom: 2px solid #e9ecef; padding-bottom: 0.5rem; }
+        h2 { font-size: 1.2rem; margin-top: 1.5rem; }
+        table { width: 100%; border-collapse: collapse; margin-top: 1rem; }
+        th, td { text-align: left; padding: 0.5rem; border-bottom: 1px solid #e9ecef; }
+        th { background: #f1f3f5; }
+        .risk-low { color: #2f9e44; }
+        .risk-mid { color: #f08c00; }
+        .risk-high { color: #e03131; }
+        .disclaimer { margin-top: 2rem; padding: 1rem; background: #fff9db; border-left: 4px solid #fcc419; font-size: 0.9rem; }
+    </style>
+</head>
+<body>
+<div class="container">
+    {% if report_type == "scan" %}
+    <h1>{{ strategy_name }} 扫描报告</h1>
+    <p>报告ID：{{ report_id }} | 扫描总数：{{ total_scanned }} | 命中数量：{{ matches | length }}</p>
+    {% if matches %}
+    <table>
+        <thead><tr><th>序号</th><th>股票代码</th><th>匹配度</th></tr></thead>
+        <tbody>
+        {% for match in matches %}
+        <tr><td>{{ loop.index }}</td><td>{{ match.symbol }}</td><td>{{ "%.2f" | format(match.match_score) }}</td></tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    {% else %}
+    <p>未找到匹配股票。</p>
+    {% endif %}
+    {% elif report_type == "analysis" %}
+    <h1>{{ symbol }} 投资分析报告</h1>
+    <p>报告ID：{{ report_id }} | 风险等级：<span class="{{ risk_class }}">{{ risk_rating }}</span></p>
+    <h2>投资建议</h2>
+    <p>{{ recommendation }}</p>
+    <h2>各维度评分</h2>
+    <table>
+        <thead><tr><th>维度</th><th>评分</th><th>摘要</th></tr></thead>
+        <tbody>
+        {% for dim, result in results.items() %}
+        <tr><td>{{ dim }}</td><td>{{ "%.0f" | format(result.score | default(0)) }}/100</td><td>{{ result.summary }}</td></tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    {% elif report_type == "backtest" %}
+    <h1>{{ strategy_name }} 回测报告</h1>
+    <p>报告ID：{{ report_id }} | 回测区间：{{ start_date }} ~ {{ end_date }}</p>
+    <h2>绩效指标</h2>
+    <table>
+        <tbody>
+        <tr><th>总收益率</th><td>{{ "%.2f%%" | format(metrics.total_return * 100) }}</td></tr>
+        <tr><th>年化收益率</th><td>{{ "%.2f%%" | format(metrics.annualized_return * 100) }}</td></tr>
+        <tr><th>胜率</th><td>{{ "%.2f%%" | format(metrics.win_rate * 100) }}</td></tr>
+        <tr><th>盈亏比</th><td>{{ "%.2f" | format(metrics.profit_factor) }}</td></tr>
+        <tr><th>最大回撤</th><td>{{ "%.2f%%" | format(metrics.max_drawdown * 100) }}</td></tr>
+        <tr><th>夏普比率</th><td>{{ "%.2f" | format(metrics.sharpe_ratio) }}</td></tr>
+        <tr><th>总交易次数</th><td>{{ metrics.total_trades }}</td></tr>
+        </tbody>
+    </table>
+    {% else %}
+    <h1>未知报告类型</h1>
+    <p>报告ID：{{ report_id }}</p>
+    {% endif %}
+    <div class="disclaimer">
+        <strong>免责声明：</strong>本报告仅供学习研究使用，不构成任何投资建议。投资有风险，决策需谨慎。
+    </div>
+</div>
+</body>
+</html>

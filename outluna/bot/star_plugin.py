@@ -1,8 +1,10 @@
 """AstrBot Star 插件入口。"""
 
-from astrbot.api import star
-from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api import star  # type: ignore[import-not-found]
+from astrbot.api.event import AstrMessageEvent, filter  # type: ignore[import-not-found]
 
+from outluna.bot.commands import CommandHandler
+from outluna.bot.formatter import MessageFormatter
 from outluna.engine import OutLunaEngine
 
 
@@ -12,6 +14,8 @@ class OutLunaPlugin(star.Star):
     def __init__(self, context: star.Context) -> None:
         self.context = context
         self.engine = OutLunaEngine()
+        self.handler = CommandHandler(self.engine)
+        self.formatter = MessageFormatter()
 
     async def initialize(self) -> None:
         """插件初始化。"""
@@ -23,7 +27,7 @@ class OutLunaPlugin(star.Star):
         await event.send("正在执行策略扫描，请稍候...")
         try:
             text = await self.engine.scan(strategy_name)
-            await event.send(text)
+            await event.send(self.formatter.truncate(text))
         except Exception as exc:
             await event.send(f"扫描失败：{exc}")
 
@@ -33,9 +37,19 @@ class OutLunaPlugin(star.Star):
         await event.send(f"正在分析 {symbol}，请稍候...")
         try:
             text = await self.engine.analyze(symbol)
-            await event.send(text)
+            await event.send(self.formatter.truncate(text))
         except Exception as exc:
             await event.send(f"分析失败：{exc}")
+
+    @filter.command("backtest")
+    async def run_backtest(self, event: AstrMessageEvent, strategy_name: str, days: int = 90):
+        """执行策略回测。用法：/backtest 十字星 90"""
+        await event.send(f"正在执行 {strategy_name} 策略回测（近 {days} 天），请稍候...")
+        try:
+            text = await self.engine.backtest(strategy_name, days)
+            await event.send(self.formatter.truncate(text))
+        except Exception as exc:
+            await event.send(f"回测失败：{exc}")
 
     @filter.command("strategy")
     async def list_strategies(self, event: AstrMessageEvent):
@@ -50,7 +64,7 @@ class OutLunaPlugin(star.Star):
             text = await self.engine.list_reports()
         else:
             text = await self.engine.get_report(report_id)
-        await event.send(text)
+        await event.send(self.formatter.truncate(text))
 
     @filter.command("compare")
     async def compare_reports(self, event: AstrMessageEvent, id1: str = "", id2: str = ""):
@@ -59,4 +73,4 @@ class OutLunaPlugin(star.Star):
             await event.send("用法：/compare <id1> <id2>")
             return
         text = await self.engine.compare_reports(id1, id2)
-        await event.send(text)
+        await event.send(self.formatter.truncate(text))

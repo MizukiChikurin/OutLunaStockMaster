@@ -3,8 +3,9 @@
 import pandas as pd
 
 from outluna.analysis.base import AnalyzerBase
+from outluna.analysis.context import AnalysisContext
 from outluna.data.gateway import DataGateway
-from outluna.data.models import AnalysisContext, AnalyzerResult
+from outluna.data.models import AnalyzerResult
 
 
 class FundamentalsAnalyzer(AnalyzerBase):

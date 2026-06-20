@@ -11,7 +11,7 @@ from outluna.analysis.institutional import InstitutionalAnalyzer
 from outluna.analysis.llm_analyst import LLMAnalyst
 from outluna.analysis.sentiment import SentimentAnalyzer
 from outluna.data.gateway import DataGateway
-from outluna.data.models import AnalysisReport, AnalyzerResult
+from outluna.data.models import AnalysisReport
 
 
 class AnalysisOrchestrator:
@@ -62,15 +62,18 @@ class AnalysisOrchestrator:
             llm_result = await LLMAnalyst(self.gateway).analyze(symbol, context)
             context.add_result(llm_result)
 
-        # 生成风险等级和投资建议
-        llm_result = context.results.get("llm")
+        # 生成风险等级和投资建议，优先使用 LLM 输出的结构化风险等级
+        final_llm_result = context.results.get("llm")
         risk_rating = ""
         recommendation = ""
-        if llm_result:
-            for signal in llm_result.signals:
-                if "风险等级" in signal:
+        if final_llm_result:
+            recommendation = final_llm_result.summary
+            for signal in final_llm_result.signals:
+                if signal.startswith("风险等级："):
                     risk_rating = signal.replace("风险等级：", "")
-            recommendation = llm_result.summary
+                    break
+            if not risk_rating:
+                risk_rating = final_llm_result.data.get("risk_rating", "")
 
         return AnalysisReport(
             report_id=str(uuid4())[:8],

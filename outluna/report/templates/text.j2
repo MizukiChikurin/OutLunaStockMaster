@@ -1,0 +1,49 @@
+{# 文本格式报告模板，适配聊天机器人输出 #}
+{% if report_type == "scan" %}
+策略：{{ strategy_name }}
+扫描总数：{{ total_scanned }}
+命中数量：{{ matches | length }}
+
+{% if matches %}
+匹配股票：
+{% for match in matches %}
+{{ loop.index }}. {{ match.symbol }}（匹配度：{{ "%.2f" | format(match.match_score) }}）
+{% endfor %}
+{% else %}
+未找到匹配股票。
+{% endif %}
+报告ID：{{ report_id }}
+{% elif report_type == "analysis" %}
+股票：{{ symbol }}
+风险等级：{{ risk_rating }}
+报告ID：{{ report_id }}
+
+投资建议：
+{{ recommendation }}
+
+各维度评分：
+{% for dim, result in results.items() %}
+- {{ dim }}：{{ "%.0f" | format(result.score | default(0)) }}/100
+{% endfor %}
+
+免责声明：本报告仅供学习研究，不构成投资建议。
+{% elif report_type == "backtest" %}
+策略：{{ strategy_name }}
+回测区间：{{ start_date }} ~ {{ end_date }}
+初始资金：{{ "%.2f" | format(initial_capital) }}
+报告ID：{{ report_id }}
+
+绩效指标：
+- 总收益率：{{ "%.2f%%" | format(metrics.total_return * 100) }}
+- 年化收益率：{{ "%.2f%%" | format(metrics.annualized_return * 100) }}
+- 胜率：{{ "%.2f%%" | format(metrics.win_rate * 100) }}
+- 盈亏比：{{ "%.2f" | format(metrics.profit_factor) }}
+- 最大回撤：{{ "%.2f%%" | format(metrics.max_drawdown * 100) }}
+- 夏普比率：{{ "%.2f" | format(metrics.sharpe_ratio) }}
+- 总交易次数：{{ metrics.total_trades }}
+
+免责声明：回测结果基于历史数据，不代表未来收益。
+{% else %}
+未知报告类型：{{ report_type }}
+报告ID：{{ report_id }}
+{% endif %}

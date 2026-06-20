@@ -46,12 +46,15 @@ class StrategyBase(ABC):
     def evaluate(self, symbol: str, df: pd.DataFrame) -> ScanResult | None:
         """评估单只股票，返回扫描结果或 None。"""
         if self.match(symbol, df):
+            trigger_data = (
+                df.iloc[-1].to_dict() if not df.empty else {}
+            )
             return ScanResult(
                 symbol=symbol,
                 strategy_name=self.name,
                 matched_at=datetime.now(),
                 match_score=1.0,
-                trigger_data=df.iloc[-1].to_dict() if not df.empty else {},
+                trigger_data={str(k): v for k, v in trigger_data.items()},
             )
         return None
 

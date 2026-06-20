@@ -1,0 +1,28 @@
+services:
+  outluna:
+    build: .
+    container_name: outluna
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    command: python -m outluna.cli
+    stdin_open: true
+    tty: true
+
+  # AstrBot 服务（可选），需要本地已准备 AstrBot 配置
+  astrbot:
+    image: soulter/astrbot:latest
+    container_name: astrbot
+    env_file:
+      - .env
+    volumes:
+      - ./data/astrbot:/AstrBot/data
+      - ./astrbot_plugin_outluna:/AstrBot/plugins/astrbot_plugin_outluna
+    ports:
+      - "6185:6185"
+    depends_on:
+      - outluna
+    profiles:
+      - astrbot

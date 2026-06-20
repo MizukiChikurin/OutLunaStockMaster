@@ -1,8 +1,11 @@
 """企业画像分析器。"""
 
+from typing import Any
+
 from outluna.analysis.base import AnalyzerBase
+from outluna.analysis.context import AnalysisContext
 from outluna.data.gateway import DataGateway
-from outluna.data.models import AnalysisContext, AnalyzerResult
+from outluna.data.models import AnalyzerResult
 
 
 class CompanyAnalyzer(AnalyzerBase):
@@ -31,7 +34,7 @@ class CompanyAnalyzer(AnalyzerBase):
                 score=0,
             )
 
-        data = {"company_info": company_info}
+        data: dict[str, Any] = {"company_info": company_info}
 
         # 公司属性
         name = company_info.get("ths_stock_short_name_stock", "")
@@ -42,6 +45,10 @@ class CompanyAnalyzer(AnalyzerBase):
             "ths_operating_scope_stock", ""
         )
 
+        if name:
+            signals.append(f"公司名称：{name}")
+        if controller:
+            signals.append(f"实控人：{controller}")
         if controller_type and "国资" in controller_type:
             score += 10
             signals.append(f"实控人为{controller_type}，背景较稳")
