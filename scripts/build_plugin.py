@@ -6,11 +6,21 @@
 
     astrbot_plugin_outluna/
         metadata.yaml          # AstrBot 插件元数据
-        main.py                # 插件入口，自动调整 sys.path 后导入 outluna
+        main.py                # 插件入口，由 outluna/bot/star_plugin.py 复制而来
         requirements.txt       # 外部依赖
         outluna/               # 项目源码（复制）
         data/                  # 数据目录占位（运行时创建）
         logs/                  # 日志目录占位（运行时创建）
+
+关键设计：
+- AstrBot 加载插件时，模块路径为 ``data.plugins.astrbot_plugin_outluna.main``。
+- 命令装饰器 ``@filter.command`` 会记录 handler 的 ``__module__``。
+- 如果 ``main.py`` 只是从 ``outluna.bot.star_plugin`` 导入 ``OutLunaPlugin``，
+  那么 handler 的 ``__module__`` 会是 ``outluna.bot.star_plugin``，
+  与 AstrBot 记录的插件 ``module_path`` 不一致，导致命令在唤醒阶段被过滤掉。
+- 因此本脚本直接把 ``outluna/bot/star_plugin.py`` 复制为插件根目录的 ``main.py``，
+  使 ``OutLunaPlugin`` 及其命令方法都在 ``data.plugins.astrbot_plugin_outluna.main``
+  模块中定义，确保命令注册路径一致。
 
 这样用户无需复制/软链接，只需把打包后的目录一次性复制到 AstrBot 的 plugins 目录即可。
 """
@@ -91,33 +101,16 @@ def _shutil_ignore(_src: str, names: list[str]) -> set[str]:
     return ignored
 
 
-def _generate_main_entry(plugin_dir: Path) -> str:
-    """生成插件 main.py 内容。
+def _generate_main_entry(plugin_dir: Path) -> None:
+    """生成插件 main.py。
 
-    关键点：
-    1. 先把插件目录本身加入 sys.path，确保能导入插件目录内的 outluna 包。
-    2. 再从 outluna.bot.star_plugin 导入插件类。
+    直接把 ``outluna/bot/star_plugin.py`` 复制为插件根目录的 ``main.py``。
+    ``star_plugin.py`` 内部已经兼容插件根目录布局，因此无需额外修改。
     """
-    return '''\
-"""AstrBot Star 插件入口。
-
-本文件由 scripts/build_plugin.py 自动生成，请勿手动修改。
-项目源码已整体打包到本插件目录内，运行时会自动调整 sys.path。
-"""
-
-import sys
-from pathlib import Path
-
-_plugin_dir = Path(__file__).parent
-
-# 确保插件目录本身在 sys.path 中，使 AstrBot 能导入插件内的 outluna 包
-if str(_plugin_dir) not in sys.path:
-    sys.path.insert(0, str(_plugin_dir))
-
-from outluna.bot.star_plugin import OutLunaPlugin
-
-__all__ = ["OutLunaPlugin"]
-'''
+    source = plugin_dir / "outluna" / "bot" / "star_plugin.py"
+    target = plugin_dir / "main.py"
+    if source.exists():
+        shutil.copy2(source, target)
 
 
 def _generate_requirements() -> str:
@@ -172,8 +165,8 @@ def build_plugin():
     (target / "logs").mkdir(exist_ok=True)
 
     # 3. 生成 AstrBot 插件入口 main.py
-    main_path = target / "main.py"
-    main_path.write_text(_generate_main_entry(target), encoding="utf-8")
+    #    直接复制 outluna/bot/star_plugin.py，使 OutLunaPlugin 类定义在 main 模块中
+    _generate_main_entry(target)
 
     # 4. 生成 metadata.yaml
     metadata_path = target / "metadata.yaml"
