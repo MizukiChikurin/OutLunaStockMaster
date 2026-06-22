@@ -45,33 +45,49 @@ class StockScanner:
     ) -> dict[str, pd.DataFrame]:
         """批量获取 K 线数据。
 
-        Kimi Datasource 历史行情每次最多 10 只，需分批。
+        优先调用数据网关的批量接口（Kimi Datasource 每次最多 10 只），
+        若批量接口不可用则自动降级为逐只获取。
         """
-        result: dict[str, pd.DataFrame] = {}
-        batch_size = 10
         req = self.strategy.required_data
 
         # 计算日期范围
         end_date = datetime.now().strftime("%Y-%m-%d")
         start_date = (datetime.now() - timedelta(days=req.bars * 3)).strftime("%Y-%m-%d")
 
-        for i in range(0, len(symbols), batch_size):
-            batch = symbols[i : i + batch_size]
-            for symbol in batch:
-                try:
-                    df = self.gateway.get_ohlcv(
-                        symbol,
-                        period=req.period,
-                        start_date=start_date,
-                        end_date=end_date,
-                        bars=req.bars,
-                        adjust=req.adjust,
-                    )
-                    if not df.empty and len(df) >= req.bars:
-                        result[symbol] = df
-                except Exception as exc:
-                    print(f"获取 {symbol} K 线失败：{exc}")
+        try:
+            ohlcv_map = self.gateway.get_ohlcv_multi(
+                symbols,
+                period=req.period,
+                start_date=start_date,
+                end_date=end_date,
+                bars=req.bars,
+                adjust=req.adjust,
+            )
+            # 过滤满足最小 K 线数量的结果
+            return {
+                symbol: df
+                for symbol, df in ohlcv_map.items()
+                if not df.empty and len(df) >= req.bars
+            }
+        except Exception as exc:
+            print(f"批量获取 K 线失败，降级为逐只获取：{exc}")
 
+        # 降级：逐只获取
+        result: dict[str, pd.DataFrame] = {}
+        for symbol in symbols:
+            try:
+                df = self.gateway.get_ohlcv(
+                    symbol,
+                    period=req.period,
+                    start_date=start_date,
+                    end_date=end_date,
+                    bars=req.bars,
+                    adjust=req.adjust,
+                )
+                if not df.empty and len(df) >= req.bars:
+                    result[symbol] = df
+            except Exception as inner_exc:
+                print(f"获取 {symbol} K 线失败：{inner_exc}")
         return result
 
     def scan(

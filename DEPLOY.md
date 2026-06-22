@@ -73,28 +73,36 @@ ls %USERPROFILE%\.kimi\credentials\kimi-code.json
 pytest
 ```
 
-## AstrBot 插件部署
+## AstrBot 插件部署（推荐方式：整体项目打包）
 
-### 方式一：本地开发部署
+本项目已将完整源码打包为 AstrBot 插件目录，部署时无需复制源码、无需创建软链接、无需在 AstrBot 环境中安装 `outluna` 包。
+
+### 方式一：本地构建后复制（推荐）
 
 ```bash
-# 生成插件目录
+# 1. 生成插件目录
 python scripts/build_plugin.py
 
-# 复制到 AstrBot 的 plugins 目录
-cp -r astrbot_plugin_outluna <AstrBot安装目录>/plugins/
+# 2. 将生成的 astrbot_plugin_outluna 目录复制到 AstrBot 的 plugins 目录
+# Windows PowerShell 示例：
+Copy-Item -Recurse -Force "E:\OutLunaStockMaster\astrbot_plugin_outluna" "C:\Users\admin\AppData\Roaming\uv\tools\astrbot\data\plugins\"
 
-# 重启 AstrBot
+# Linux/macOS 示例：
+# cp -r E:/OutLunaStockMaster/astrbot_plugin_outluna /path/to/astrbot/data/plugins/
+
+# 3. 重启 AstrBot
 ```
 
-### 方式二：软链接开发（推荐开发时使用）
+### 方式二：直接下载插件包
+
+如果已获取打包好的 `astrbot_plugin_outluna.zip`：
 
 ```bash
-# Windows PowerShell（管理员）
-New-Item -ItemType SymbolicLink -Path "<AstrBot安装目录>\plugins\astrbot_plugin_outluna" -Target "E:\OutLunaStockMaster\astrbot_plugin_outluna"
+# Windows PowerShell
+Expand-Archive -Path astrbot_plugin_outluna.zip -DestinationPath "C:\Users\admin\AppData\Roaming\uv\tools\astrbot\data\plugins\"
 
 # Linux/macOS
-ln -s E:/OutLunaStockMaster/astrbot_plugin_outluna <AstrBot安装目录>/plugins/astrbot_plugin_outluna
+# unzip astrbot_plugin_outluna.zip -d /path/to/astrbot/data/plugins/
 ```
 
 ### 验证插件加载
@@ -106,6 +114,22 @@ ln -s E:/OutLunaStockMaster/astrbot_plugin_outluna <AstrBot安装目录>/plugins
 ```
 
 如果返回可用策略列表，说明插件加载成功。
+
+### 插件目录结构说明
+
+打包后的插件目录已包含完整项目源码：
+
+```
+astrbot_plugin_outluna/
+├── main.py              # AstrBot 插件入口
+├── metadata.yaml        # 插件元数据
+├── requirements.txt     # 外部依赖（仅含 PyPI 可安装包）
+├── outluna/             # 完整项目源码
+├── data/                # 运行时数据目录
+└── logs/                # 运行时日志目录
+```
+
+`main.py` 会自动调整 `sys.path`，使 AstrBot 能够直接导入插件内部的 `outluna` 包，因此无需额外安装 `outluna`。
 
 ## 数据源说明
 
@@ -134,6 +158,13 @@ ln -s E:/OutLunaStockMaster/astrbot_plugin_outluna <AstrBot安装目录>/plugins
 - 回测使用历史日 K 数据，不含分红、拆股等细节
 - 默认交易成本为万5，可在 `Portfolio` 中调整
 - 策略信号基于收盘价，实际滑点未完全模拟
+
+### Q4: AstrBot 插件加载失败
+
+- 确认使用的是 `scripts/build_plugin.py` 生成的完整插件目录
+- 确认插件目录名为 `astrbot_plugin_outluna`
+- 检查 AstrBot 日志中是否有依赖安装失败信息
+- 若使用 uv 打包版 AstrBot，请确保 requirements.txt 中的依赖可被正常安装
 
 ## 免责声明
 

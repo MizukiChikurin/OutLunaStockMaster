@@ -49,3 +49,7 @@ Thumbs.db
 
 # 构建产物
 astrbot_plugin_outluna/
+
+# 插件构建时生成的临时目录
+astrbot_plugin_outluna.zip
+astrbot_plugin_outluna.tar.gz

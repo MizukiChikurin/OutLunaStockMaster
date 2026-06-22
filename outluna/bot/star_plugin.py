@@ -1,5 +1,15 @@
 """AstrBot Star 插件入口。"""
 
+import sys
+from pathlib import Path
+
+# 当插件被 AstrBot 以独立目录加载时，将项目根目录加入 sys.path，
+# 确保可以从 outluna 包导入引擎与命令处理逻辑。
+_plugin_dir = Path(__file__).parent
+_project_root = _plugin_dir.parent.parent
+if _project_root.exists() and str(_project_root) not in sys.path:
+    sys.path.insert(0, str(_project_root))
+
 from astrbot.api import star  # type: ignore[import-not-found]
 from astrbot.api.event import AstrMessageEvent, filter  # type: ignore[import-not-found]
 

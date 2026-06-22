@@ -8,6 +8,7 @@ from outluna.strategy import registry
 from outluna.strategy.scanner import StockScanner
 from outluna.utils.logger import setup_logging
 from outluna.utils.metrics import metrics
+from outluna.utils.validation import InputValidator
 
 logger = setup_logging()
 
@@ -30,6 +31,11 @@ class OutLunaEngine:
         max_candidates: int | None = None,
     ) -> str:
         """执行策略扫描并保存报告，返回报告文本。"""
+        strategy_name = InputValidator.validate_strategy_name(strategy_name)
+        max_candidates = InputValidator.validate_max_candidates(max_candidates)
+        if universe is not None:
+            universe = InputValidator.validate_symbols(universe)
+
         metric = metrics.start_operation("scan", strategy=strategy_name)
         try:
             strategy = registry.build(strategy_name)
@@ -46,6 +52,10 @@ class OutLunaEngine:
 
     async def analyze(self, symbol: str, strategy_name: str = "") -> str:
         """分析指定股票并保存报告，返回报告文本。"""
+        symbol = InputValidator.validate_symbol(symbol)
+        if strategy_name:
+            strategy_name = InputValidator.validate_strategy_name(strategy_name)
+
         metric = metrics.start_operation("analyze", symbol=symbol)
         try:
             orchestrator = AnalysisOrchestrator(self.gateway, enable_llm=False)
@@ -66,6 +76,11 @@ class OutLunaEngine:
         universe: list[str] | None = None,
     ) -> str:
         """执行策略回测并保存报告，返回报告文本。"""
+        strategy_name = InputValidator.validate_strategy_name(strategy_name)
+        days = InputValidator.validate_days(days)
+        if universe is not None:
+            universe = InputValidator.validate_symbols(universe)
+
         from datetime import datetime, timedelta
 
         metric = metrics.start_operation("backtest", strategy=strategy_name, days=days)
@@ -98,6 +113,7 @@ class OutLunaEngine:
 
     async def get_report(self, report_id: str) -> str:
         """获取报告内容。"""
+        report_id = InputValidator.validate_report_id(report_id)
         data = self.report_generator.load(report_id)
         if not data:
             return f"未找到报告：{report_id}"
@@ -119,6 +135,8 @@ class OutLunaEngine:
 
     async def compare_reports(self, id1: str, id2: str) -> str:
         """对比两份报告。"""
+        id1 = InputValidator.validate_report_id(id1)
+        id2 = InputValidator.validate_report_id(id2)
         result = self.report_generator.compare(id1, id2)
         import json
         return json.dumps(result, ensure_ascii=False, indent=2)
@@ -165,4 +183,3 @@ class OutLunaEngine:
             f"报告ID：{report.report_id}",
         ]
         return "\n".join(lines)
-

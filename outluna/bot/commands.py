@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from outluna.engine import OutLunaEngine
 from outluna.utils.logger import setup_logging
+from outluna.utils.validation import ValidationError
 
 logger = setup_logging()
 
@@ -57,6 +58,9 @@ class CommandHandler:
             if command == "help":
                 return self._help()
             return f"未知命令：/{command}\n{self._help()}"
+        except ValidationError as exc:
+            logger.warning(f"参数校验失败：/{command} {args} - {exc}")
+            return f"参数错误：{exc}"
         except Exception as exc:
             logger.exception(f"命令执行失败：/{command} {args}")
             return f"执行失败：{exc}"
