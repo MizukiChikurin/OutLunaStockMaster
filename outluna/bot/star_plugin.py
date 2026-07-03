@@ -31,18 +31,45 @@ else:
 if _project_root.exists() and str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
-from astrbot.api import star  # type: ignore[import-not-found]
-from astrbot.api.event import AstrMessageEvent, filter  # type: ignore[import-not-found]
-from astrbot.api.event import MessageChain  # type: ignore[import-not-found]
+# 强制清除可能已缓存的 outluna 模块，确保 AstrBot 加载/重载插件时使用插件自带的最新代码。
+# 否则 Python 可能复用旧的 sys.modules 条目，导致代码更新不生效。
+for _module_name in list(sys.modules.keys()):
+    if _module_name == "outluna" or _module_name.startswith("outluna."):
+        del sys.modules[_module_name]
 
+from astrbot.api import star  # type: ignore[import-not-found]
+from astrbot.api.event import (  # type: ignore[import-not-found]
+    AstrMessageEvent,
+    MessageChain,  # type: ignore[import-not-found]
+    filter,
+)
+
+import outluna
+from outluna.bot.astrbot_llm_provider import AstrBotLLMProvider
 from outluna.bot.commands import CommandHandler
 from outluna.bot.formatter import MessageFormatter
 from outluna.engine import OutLunaEngine
+from outluna.report.generator import ReportGenerator, ReportStorage
+from outluna.utils.logger import setup_logging
+
+logger = setup_logging()
+
+
+def _plugin_data_dir() -> Path:
+    """获取插件数据目录（AstrBot 场景下为插件根目录下的 data/）。"""
+    plugin_root = Path(__file__).parent
+    return plugin_root / "data"
 
 
 def _message(text: str) -> MessageChain:
-    """把普通文本包装为 AstrBot 兼容的 MessageChain 消息链。"""
-    return MessageChain().message(text)
+
+    """把普通文本包装为 AstrBot 兼容的 MessageChain 消息链。
+
+    同时清理 Kimi 数据源返回中无法解码的替换字符（\ufffd），
+    避免部分消息平台/前端因非法字节而显示为空。
+    """
+    cleaned = text.replace("\ufffd", "")
+    return MessageChain().message(cleaned)
 
 
 class OutLunaPlugin(star.Star):
@@ -51,13 +78,29 @@ class OutLunaPlugin(star.Star):
     def __init__(self, context: star.Context) -> None:
         super().__init__(context)
         self.context = context
-        self.engine = OutLunaEngine()
+        # AstrBot 场景下将报告保存到插件自己的 data/reports 目录
+        data_dir = _plugin_data_dir()
+        report_dir = data_dir / "reports"
+        report_dir.mkdir(parents=True, exist_ok=True)
+        report_storage = ReportStorage(report_dir=report_dir)
+        # AstrBot 场景下复用其已配置的 LLM
+        self.engine = OutLunaEngine(
+            llm_provider=None,
+        )
+        self.engine.report_generator = ReportGenerator(storage=report_storage)
         self.handler = CommandHandler(self.engine)
         self.formatter = MessageFormatter()
 
     async def initialize(self) -> None:
         """插件初始化。"""
+        logger.info(
+            f"OutLuna 插件初始化，版本：{outluna.__version__}，路径：{Path(__file__).parent}"
+        )
         await self.engine.initialize()
+
+    def _get_llm_provider(self, event: AstrMessageEvent) -> AstrBotLLMProvider:
+        """为当前事件创建 AstrBot LLM Provider。"""
+        return AstrBotLLMProvider(self.context, event)
 
     @filter.command("scan")
     async def scan_stocks(self, event: AstrMessageEvent, strategy_name: str = "十字星"):
@@ -68,6 +111,19 @@ class OutLunaPlugin(star.Star):
             await event.send(_message(self.formatter.truncate(text)))
         except Exception as exc:
             await event.send(_message(f"扫描失败：{exc}"))
+
+    @filter.command("选股")
+    async def select_stocks(self, event: AstrMessageEvent, requirements: str = ""):
+        """执行用户自定义选股。用法：/选股 <选股要求>"""
+        await event.send(_message("正在根据您的要求执行选股，请稍候..."))
+        try:
+            llm_provider = self._get_llm_provider(event)
+            logger.info(f"/选股 使用 AstrBot LLM Provider，可用：{llm_provider.available}")
+            self.engine.llm_provider = llm_provider
+            text = await self.engine.select_stocks(requirements)
+            await event.send(_message(self.formatter.truncate(text)))
+        except Exception as exc:
+            await event.send(_message(f"选股失败：{exc}"))
 
     @filter.command("analyze")
     async def analyze_stock(self, event: AstrMessageEvent, symbol: str):

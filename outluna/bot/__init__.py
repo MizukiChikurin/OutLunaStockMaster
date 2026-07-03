@@ -1,10 +1,9 @@
 """AstrBot 插件包入口。
 
-此文件在作为 Python 包导入时使用，提供 OutLunaPlugin 类。
-AstrBot 实际加载插件时，优先读取 main.py 或 <插件目录名>.py，
-因此入口逻辑主要在 star_plugin.py / main.py 中实现。
+AstrBot 实际加载插件时，优先读取打包后的 ``main.py``，
+因此入口逻辑在 ``star_plugin.py`` / ``main.py`` 中实现。
+本文件不再主动导入 ``star_plugin``，避免在非 AstrBot 环境（如测试、CLI）中
+因缺少 astrbot 依赖而导致导入失败。
 """
 
-from outluna.bot.star_plugin import OutLunaPlugin
-
-__all__ = ["OutLunaPlugin"]
+__all__: list[str] = []

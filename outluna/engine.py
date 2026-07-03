@@ -3,6 +3,7 @@
 from outluna.analysis.orchestrator import AnalysisOrchestrator
 from outluna.backtest.engine import run_backtest
 from outluna.data.gateway import DataGateway
+from outluna.llm.base import LLMProvider
 from outluna.report.generator import ReportGenerator
 from outluna.strategy import registry
 from outluna.strategy.scanner import StockScanner
@@ -16,9 +17,10 @@ logger = setup_logging()
 class OutLunaEngine:
     """OutLuna 核心引擎。"""
 
-    def __init__(self):
+    def __init__(self, llm_provider: LLMProvider | None = None):
         self.gateway = DataGateway()
         self.report_generator = ReportGenerator()
+        self.llm_provider = llm_provider
 
     async def initialize(self) -> None:
         """初始化引擎。"""
@@ -40,7 +42,7 @@ class OutLunaEngine:
         try:
             strategy = registry.build(strategy_name)
             scanner = StockScanner(self.gateway, strategy)
-            report = scanner.scan(universe=universe, max_candidates=max_candidates)
+            report = await scanner.scan(universe=universe, max_candidates=max_candidates)
             self.report_generator.save(report)
             metric.finish(success=True, matched=len(report.matches))
             logger.info(f"扫描完成：{strategy_name}，命中 {len(report.matches)} 只")
@@ -48,6 +50,44 @@ class OutLunaEngine:
         except Exception as exc:
             metric.finish(success=False, error=str(exc))
             logger.error(f"扫描失败：{exc}")
+            raise
+
+    async def select_stocks(self, requirements_text: str = "") -> str:
+        """执行用户自定义选股流程并返回报告文本。
+
+        该方法对应“选股要求以聊天形式输入”的场景。
+        若未提供选股要求文本，则提示用户输入。
+        """
+        metric = metrics.start_operation("select_stocks")
+        try:
+            if not requirements_text or not requirements_text.strip():
+                return (
+                    "请提供选股要求。\n"
+                    "用法：/选股 <选股要求文本>\n"
+                    "例如：/选股 选择近5日涨幅不超过10%、RSI在40-70之间、站上MA5的股票"
+                )
+
+            strategy = registry.build("用户自定义选股", params={
+                "requirements_text": requirements_text,
+                "llm_provider": self.llm_provider,
+            })
+            # 显式确保 llm_provider 传递到策略实例，避免依赖 _apply_params
+            if self.llm_provider is not None and hasattr(strategy, "llm_provider"):
+                strategy.llm_provider = self.llm_provider
+                logger.debug(f"已将 llm_provider 注入策略：{type(self.llm_provider).__name__}")
+
+            scanner = StockScanner(self.gateway, strategy)
+            report = await scanner.scan()
+            txt_path = self.report_generator.save(report)
+            formatted = report.format_text()
+            return (
+                f"{formatted}\n\n"
+                f"---\n"
+                f"完整选股报告已保存至：{txt_path}"
+            )
+        except Exception as exc:
+            metric.finish(success=False, error=str(exc))
+            logger.error(f"选股失败：{exc}")
             raise
 
     async def analyze(self, symbol: str, strategy_name: str = "") -> str:

@@ -1,6 +1,6 @@
-"""报告生成与存储。"""
-
 import json
+import re
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -8,8 +8,21 @@ from typing import Any
 from jinja2 import Environment, FileSystemLoader
 
 from outluna.config import settings
-from outluna.data.models import AnalysisReport, BacktestReport, ScanReport
+from outluna.data.models import AnalysisReport, BacktestReport, DataCall, ScanReport
 from outluna.data.storage import SQLiteStorage
+
+
+@dataclass
+class ReportPaths:
+    """报告保存后的路径集合。"""
+
+    json: Path
+    md: Path
+    html: Path
+    txt: Path
+    task_folder: Path | None = None
+    summary_md: Path | None = None
+    detailed_md: Path | None = None
 
 
 def _get_risk_class(risk_rating: str) -> str:
@@ -19,6 +32,12 @@ def _get_risk_class(risk_rating: str) -> str:
     if "高" in risk_rating:
         return "risk-high"
     return "risk-mid"
+
+
+def _sanitize_folder_name(name: str) -> str:
+    """清理文件夹名称中的非法字符。"""
+    name = re.sub(r'[\\/:*?"<>|]', "-", name)
+    return name.strip("-.")
 
 
 class ReportStorage:
@@ -31,27 +50,215 @@ class ReportStorage:
         template_dir = Path(__file__).parent / "templates"
         self._env = Environment(loader=FileSystemLoader(str(template_dir)), autoescape=False)
 
-    def save(self, report: AnalysisReport | ScanReport | BacktestReport) -> Path:
-        """保存报告为 JSON、Markdown 和 HTML，并写入数据库索引。"""
+    def save(self, report: AnalysisReport | ScanReport | BacktestReport) -> ReportPaths:
+        """保存报告为 JSON、Markdown、HTML 和 TXT，并写入数据库索引。"""
         data = self._serialize(report)
-        json_path = self.report_dir / f"{report.report_id}.json"
-        md_path = self.report_dir / f"{report.report_id}.md"
-        html_path = self.report_dir / f"{report.report_id}.html"
+        paths = ReportPaths(
+            json=self.report_dir / f"{report.report_id}.json",
+            md=self.report_dir / f"{report.report_id}.md",
+            html=self.report_dir / f"{report.report_id}.html",
+            txt=self.report_dir / f"{report.report_id}.txt",
+        )
 
-        with open(json_path, "w", encoding="utf-8") as f:
+        with open(paths.json, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, default=str, indent=2)
 
         md_content = self._to_markdown(report)
-        with open(md_path, "w", encoding="utf-8") as f:
+        with open(paths.md, "w", encoding="utf-8") as f:
             f.write(md_content)
 
         html_content = self._render_html(report, data)
         if html_content:
-            with open(html_path, "w", encoding="utf-8") as f:
+            with open(paths.html, "w", encoding="utf-8") as f:
                 f.write(html_content)
 
-        self._save_to_db(report, str(json_path))
-        return json_path
+        txt_content = self._to_text(report)
+        with open(paths.txt, "w", encoding="utf-8") as f:
+            f.write(txt_content)
+
+        self._save_to_db(report, str(paths.json))
+
+        # 选股报告额外生成任务文件夹：总结 + 详细流程
+        if isinstance(report, ScanReport) and report.task_folder:
+            paths.task_folder, paths.summary_md, paths.detailed_md = self._save_task_folder(report)
+
+        return paths
+
+    def _save_task_folder(self, report: ScanReport) -> tuple[Path, Path, Path]:
+        """生成任务文件夹，包含总结.md 和 详细流程.md。"""
+        folder_name = _sanitize_folder_name(report.task_folder)
+        task_folder = self.report_dir.parent / "tasks" / folder_name
+        task_folder.mkdir(parents=True, exist_ok=True)
+
+        summary_path = task_folder / "总结.md"
+        detailed_path = task_folder / "详细流程.md"
+
+        summary_content = self._build_summary(report)
+        detailed_content = self._build_detailed_process(report)
+
+        with open(summary_path, "w", encoding="utf-8") as f:
+            f.write(summary_content)
+        with open(detailed_path, "w", encoding="utf-8") as f:
+            f.write(detailed_content)
+
+        return task_folder, summary_path, detailed_path
+
+    def _build_summary(self, report: ScanReport) -> str:
+        """构建总结报告：只显示结果。"""
+        lines = [
+            f"# {report.strategy_name} - 总结报告",
+            "",
+            f"- 分析日期：{report.created_at.strftime('%Y年%m月%d日')}",
+            f"- 数据时间：{report.data_time}",
+            f"- 数据来源：{report.data_source}",
+            f"- 扫描总数：{report.total_scanned} 只",
+            "",
+        ]
+
+        if report.market_summary:
+            lines.append("## 市场环境")
+            lines.append(report.market_summary)
+            lines.append("")
+
+        if report.qualified:
+            lines.append(f"## 推荐候选（评分≥{self._min_score(report):.0f}分，共 {len(report.qualified)} 只）")
+            for idx, item in enumerate(report.qualified, 1):
+                lines.append(
+                    f"{idx}. {item.symbol} {item.name} | "
+                    f"总分：{item.match_score:.0f} | "
+                    f"最新价：{item.price:.2f} 涨跌：{item.change_pct:+.2f}% "
+                    f"成交额：{item.turnover:.2f}亿"
+                )
+                if item.notes:
+                    lines.append(f"   亮点：{' | '.join(item.notes[:3])}")
+            lines.append("")
+        else:
+            lines.append("## 推荐候选")
+            lines.append("无符合推荐条件的股票。")
+            lines.append("")
+
+        if report.watch_list:
+            lines.append(f"## 观察股（共 {len(report.watch_list)} 只）")
+            for idx, item in enumerate(report.watch_list, 1):
+                lines.append(
+                    f"{idx}. {item.symbol} {item.name} | "
+                    f"总分：{item.match_score:.0f} | "
+                    f"最新价：{item.price:.2f} 涨跌：{item.change_pct:+.2f}% "
+                    f"成交额：{item.turnover:.2f}亿"
+                )
+            lines.append("")
+
+        if report.vetoed:
+            lines.append(f"## 一票否决（共 {len(report.vetoed)} 只）")
+            for idx, item in enumerate(report.vetoed[:20], 1):
+                lines.append(f"{idx}. {item.symbol} {item.name} | 原因：{'；'.join(item.vetos[:3])}")
+            if len(report.vetoed) > 20:
+                lines.append(f"... 还有 {len(report.vetoed) - 20} 只")
+            lines.append("")
+
+        if report.final_conclusion:
+            lines.append("## 最终结论")
+            lines.append(report.final_conclusion)
+            lines.append("")
+
+        lines.append(
+            "> ⚠️ AI生成，不构成投资建议。股市有风险，投资需谨慎。"
+        )
+        return "\n".join(lines)
+
+    def _build_detailed_process(self, report: ScanReport) -> str:
+        """构建详细流程报告：记录每一步调用的接口和股票。"""
+        trace = report.execution_trace
+        lines = [
+            f"# {report.strategy_name} - 详细流程",
+            "",
+            f"- 报告ID：{report.report_id}",
+            f"- 生成时间：{report.created_at.strftime('%Y-%m-%d %H:%M:%S')}",
+            f"- 数据时间：{report.data_time}",
+            f"- 数据来源：{report.data_source}",
+            "",
+            "## 一、执行流程概述",
+            "",
+            "本次选股任务按以下阶段执行：",
+            "",
+        ]
+
+        for idx, phase in enumerate(trace.phases, 1):
+            lines.append(f"{idx}. **{phase['name']}**：{phase['description']}")
+            details = phase.get("details") or {}
+            if details:
+                for k, v in details.items():
+                    lines.append(f"   - {k}：{v}")
+        lines.append("")
+
+        if trace.stock_counts:
+            lines.append("## 二、股票池变化")
+            lines.append("")
+            lines.append("| 步骤 | 股票数量 | 说明 |")
+            lines.append("|------|----------|------|")
+            for count in trace.stock_counts:
+                lines.append(f"| {count['step']} | {count['count']} | {count['note']} |")
+            lines.append("")
+
+        if trace.data_calls:
+            lines.append("## 三、数据源调用详情")
+            lines.append("")
+
+            grouped: dict[str, list[DataCall]] = {}
+            for call in trace.data_calls:
+                grouped.setdefault(call.phase, []).append(call)
+
+            for phase_name, calls in grouped.items():
+                lines.append(f"### {phase_name}")
+                lines.append("")
+                total = len(calls)
+                success = sum(1 for c in calls if c.status == "成功")
+                elapsed = sum(c.elapsed_seconds for c in calls)
+                lines.append(f"- 调用次数：{total} 次（成功 {success} 次）")
+                lines.append(f"- 总耗时：{elapsed:.2f} 秒")
+                lines.append("")
+                lines.append("| 序号 | 数据源 | 接口 | 股票 | 参数 | 状态 | 结果摘要 | 耗时(秒) |")
+                lines.append("|------|--------|------|------|------|------|----------|----------|")
+                for idx, call in enumerate(calls, 1):
+                    symbols = ", ".join(call.symbols[:10]) or "-"
+                    if len(call.symbols) > 10:
+                        symbols += f" 等{len(call.symbols)}只"
+                    params = json.dumps(call.params, ensure_ascii=False) if call.params else "-"
+                    lines.append(
+                        f"| {idx} | {call.provider} | {call.method} | {symbols} | {params} | "
+                        f"{call.status} | {call.result_summary} | {call.elapsed_seconds:.2f} |"
+                    )
+                lines.append("")
+        else:
+            lines.append("## 三、数据源调用详情")
+            lines.append("")
+            lines.append("未记录到数据源调用。")
+            lines.append("")
+
+        if trace.notes:
+            lines.append("## 四、执行备注")
+            lines.append("")
+            for note in trace.notes:
+                lines.append(f"- {note}")
+            lines.append("")
+
+        lines.append("## 五、最终筛选结果")
+        lines.append("")
+        lines.append(f"- 进入详细分析：{report.total_scanned} 只")
+        lines.append(f"- 推荐候选：{len(report.qualified)} 只")
+        lines.append(f"- 观察股：{len(report.watch_list)} 只")
+        lines.append(f"- 一票否决：{len(report.vetoed)} 只")
+        lines.append("")
+        lines.append(
+            "> ⚠️ AI生成，不构成投资建议。股市有风险，投资需谨慎。"
+        )
+        return "\n".join(lines)
+
+    def _min_score(self, report: ScanReport) -> float:
+        """获取推荐最低分。"""
+        if report.qualified:
+            return min(r.match_score for r in report.qualified)
+        return 85.0
 
     def _save_to_db(self, report: AnalysisReport | ScanReport | BacktestReport, report_path: str) -> None:
         """将报告元数据写入数据库。"""
@@ -144,15 +351,39 @@ class ReportStorage:
                 "strategy_name": report.strategy_name,
                 "strategy_params": report.strategy_params,
                 "total_scanned": report.total_scanned,
+                "data_time": report.data_time,
+                "data_source": report.data_source,
+                "market_summary": report.market_summary,
+                "final_conclusion": report.final_conclusion,
                 "matches": [
                     {
                         "symbol": m.symbol,
+                        "name": m.name,
+                        "price": m.price,
+                        "change_pct": m.change_pct,
+                        "turnover": m.turnover,
                         "match_score": m.match_score,
+                        "recommendation": m.recommendation,
+                        "score_details": m.score_details,
+                        "notes": m.notes,
+                        "vetos": m.vetos,
                         "matched_at": m.matched_at.isoformat(),
                     }
                     for m in report.matches
                 ],
-                "title": f"{report.strategy_name} 扫描报告",
+                "qualified": [
+                    {"symbol": m.symbol, "name": m.name, "match_score": m.match_score}
+                    for m in report.qualified
+                ],
+                "watch_list": [
+                    {"symbol": m.symbol, "name": m.name, "match_score": m.match_score}
+                    for m in report.watch_list
+                ],
+                "vetoed": [
+                    {"symbol": m.symbol, "name": m.name, "vetos": m.vetos}
+                    for m in report.vetoed
+                ],
+                "title": f"{report.strategy_name}报告",
             }
         elif isinstance(report, BacktestReport):
             return {
@@ -243,9 +474,9 @@ class ReportStorage:
                 "## 绩效指标",
                 "",
                 f"- 总收益率：{report.metrics.total_return:.2%}",
-                f"- 年化收益率：{report.metrics.annualized_return:.2%}",
-                f"- 基准收益率（沪深300）：{report.metrics.benchmark_return:.2%}",
-                f"- 超额收益（Alpha）：{report.metrics.alpha:.2%}",
+                f"- 年化收益率：{report.metrics.annualized_return:.2f}",
+                f"- 基准收益率（沪深300）：{report.metrics.benchmark_return:.2f}",
+                f"- 超额收益（Alpha）：{report.metrics.alpha:.2f}",
                 f"- 胜率：{report.metrics.win_rate:.2%}",
                 f"- 盈亏比：{report.metrics.profit_factor:.2f}",
                 f"- 最大回撤：{report.metrics.max_drawdown:.2%}",
@@ -262,6 +493,16 @@ class ReportStorage:
                 )
             return "\n".join(lines)
 
+        return ""
+
+    def _to_text(self, report: AnalysisReport | ScanReport | BacktestReport) -> str:
+        """生成面向聊天场景的纯文本报告，便于用户直接阅读。"""
+        if isinstance(report, ScanReport):
+            return report.format_text()
+        if isinstance(report, AnalysisReport):
+            return self._to_markdown(report)
+        if isinstance(report, BacktestReport):
+            return self._to_markdown(report)
         return ""
 
     def _render_html(self, report: AnalysisReport | ScanReport | BacktestReport, data: dict[str, Any]) -> str:
@@ -285,9 +526,11 @@ class ReportGenerator:
         self.storage = storage or ReportStorage()
 
     def save(self, report: AnalysisReport | ScanReport | BacktestReport) -> str:
-        """保存报告并返回报告 ID。"""
-        self.storage.save(report)
-        return report.report_id
+        """保存报告并返回 txt 报告路径。"""
+        paths = self.storage.save(report)
+        if paths.detailed_md:
+            return str(paths.detailed_md)
+        return str(paths.txt)
 
     def load(self, report_id: str) -> dict[str, Any] | None:
         """加载报告。"""

@@ -22,8 +22,8 @@ wheels/
 plans/
 
 # 数据与日志
-data/
-logs/
+/data/
+/logs/
 *.log
 
 # IDE

@@ -45,6 +45,8 @@ class CommandHandler:
         try:
             if command == "scan":
                 return await self._scan(args)
+            if command == "选股":
+                return await self._select_stocks(args)
             if command == "analyze":
                 return await self._analyze(args)
             if command == "backtest":
@@ -69,6 +71,11 @@ class CommandHandler:
         """处理 /scan [策略名] 命令。"""
         strategy = args[0] if args else "十字星"
         return await self.engine.scan(strategy)
+
+    async def _select_stocks(self, args: list[str]) -> str:
+        """处理 /选股 [选股要求文本] 命令。"""
+        requirements = " ".join(args) if args else ""
+        return await self.engine.select_stocks(requirements)
 
     async def _analyze(self, args: list[str]) -> str:
         """处理 /analyze <代码> 命令。"""
@@ -107,6 +114,7 @@ class CommandHandler:
         return (
             "可用命令：\n"
             "/scan [策略名] - 执行策略扫描\n"
+            "/选股 <要求> - 根据用户提供的选股要求执行筛选\n"
             "/analyze <代码> - 分析指定股票\n"
             "/backtest <策略名> [天数] - 策略回测\n"
             "/report [报告ID] - 查看报告\n"

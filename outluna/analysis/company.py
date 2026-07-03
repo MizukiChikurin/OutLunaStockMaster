@@ -49,9 +49,10 @@ class CompanyAnalyzer(AnalyzerBase):
             signals.append(f"公司名称：{name}")
         if controller:
             signals.append(f"实控人：{controller}")
-        if controller_type and "国资" in controller_type:
+        controller_type_str = str(controller_type) if controller_type is not None else ""
+        if controller_type_str and "国资" in controller_type_str:
             score += 10
-            signals.append(f"实控人为{controller_type}，背景较稳")
+            signals.append(f"实控人为{controller_type_str}，背景较稳")
         if scale:
             signals.append(f"企业规模：{scale}")
         if business:

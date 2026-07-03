@@ -1,12 +1,16 @@
 """全市场扫描器。"""
 
 from datetime import datetime, timedelta
+from typing import Any, cast
 
 import pandas as pd
 
 from outluna.data.gateway import DataGateway
 from outluna.data.models import ScanReport, ScanResult
 from outluna.strategy.base import StrategyBase
+from outluna.utils.logger import setup_logging
+
+logger = setup_logging()
 
 
 class StockScanner:
@@ -90,12 +94,17 @@ class StockScanner:
                 print(f"获取 {symbol} K 线失败：{inner_exc}")
         return result
 
-    def scan(
+    async def scan(
         self,
         universe: list[str] | None = None,
         max_candidates: int | None = None,
     ) -> ScanReport:
         """执行策略扫描。"""
+        # 若策略实现了批量数据准备与评估，优先走批量流程
+        batch_data = await self._try_prepare_batch_data()
+        if batch_data is not None:
+            return await self._run_batch_scan(batch_data)
+
         candidates = self._get_candidate_symbols(universe)
         if max_candidates:
             candidates = candidates[:max_candidates]
@@ -111,10 +120,36 @@ class StockScanner:
         return ScanReport(
             report_id=self._generate_report_id(),
             strategy_name=self.strategy.name,
-            strategy_params=self.strategy.params,
+            strategy_params=self.strategy.serializable_params,
             created_at=datetime.now(),
             matches=matches,
             total_scanned=len(candidates),
+        )
+
+    async def _try_prepare_batch_data(self) -> Any | None:
+        """尝试调用策略的批量数据准备方法。"""
+        try:
+            data = await self.strategy.prepare_data(self.gateway)
+            if data is not None:
+                return data
+        except Exception as exc:
+            logger.warning(f"策略批量数据准备失败，回退到传统扫描：{exc}")
+        return None
+
+    async def _run_batch_scan(self, data: Any) -> ScanReport:
+        """执行策略批量评估。"""
+        matches = await self.strategy.evaluate_batch(data)
+        # 若策略提供了报告构建方法，则使用它以获得完整分类报告
+        if hasattr(self.strategy, "build_scan_report"):
+            report = self.strategy.build_scan_report(self._generate_report_id())
+            return cast(ScanReport, report)
+        return ScanReport(
+            report_id=self._generate_report_id(),
+            strategy_name=self.strategy.name,
+            strategy_params=self.strategy.serializable_params,
+            created_at=datetime.now(),
+            matches=matches,
+            total_scanned=len(matches),
         )
 
     def _generate_report_id(self) -> str:

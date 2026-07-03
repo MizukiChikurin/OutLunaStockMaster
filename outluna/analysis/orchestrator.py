@@ -3,6 +3,8 @@
 from datetime import datetime
 from uuid import uuid4
 
+import pandas as pd
+
 from outluna.analysis.base import AnalyzerBase
 from outluna.analysis.company import CompanyAnalyzer
 from outluna.analysis.context import AnalysisContext
@@ -55,7 +57,11 @@ class AnalysisOrchestrator:
 
         # 预加载 K 线数据供各分析器共享
         try:
-            context.kline_data = self.gateway.get_ohlcv(symbol, bars=60)
+            end_date = datetime.now().strftime("%Y-%m-%d")
+            start_date = (datetime.now() - pd.Timedelta(days=120)).strftime("%Y-%m-%d")
+            context.kline_data = self.gateway.get_ohlcv(
+                symbol, start_date=start_date, end_date=end_date, bars=60
+            )
         except Exception:
             context.kline_data = None
 

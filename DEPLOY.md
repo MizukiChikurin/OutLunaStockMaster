@@ -113,7 +113,28 @@ Expand-Archive -Path astrbot_plugin_outluna.zip -DestinationPath "C:\Users\admin
 /strategy
 ```
 
-如果返回可用策略列表，说明插件加载成功。
+如果返回可用策略列表（包含“超短线风控选股”），说明插件加载成功。
+
+### 常用命令
+
+| 命令 | 说明 | 示例 |
+|------|------|------|
+| `/scan [策略名]` | 执行策略扫描 | `/scan 十字星` |
+| `/选股 <要求>` | 根据用户选股要求执行筛选 | `/选股 选择站上MA5的股票` |
+| `/analyze <代码>` | 分析指定股票 | `/analyze 600519` |
+| `/backtest <策略名> [天数]` | 执行策略回测 | `/backtest 十字星 90` |
+| `/report [报告ID]` | 查看报告 | `/report` |
+
+`超短线风控选股` 是内置示例策略，会按照 ``plans/选股要求.txt`` 中的规则执行。
+
+自定义选股要求：
+
+```
+/选股 选择近5日涨幅不超过10%、RSI在40-70之间、站上MA5的股票
+```
+
+自定义选股会自动复用 AstrBot 中已配置的 LLM 来解析要求，无需单独设置 `OUTLUNA_LLM_API_KEY`。
+如需在 CLI 中使用自定义选股，则需在 `.env` 中配置 `OUTLUNA_LLM_API_KEY`。
 
 ### 插件目录结构说明
 

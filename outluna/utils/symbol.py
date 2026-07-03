@@ -31,6 +31,7 @@ class SymbolNormalizer:
             - ``600519`` → ``600519.SH``
             - ``600519.SS`` → ``600519.SH``
             - ``000001.SZ`` → ``000001.SZ``
+            - ``sh600519`` / ``sz000001`` → ``600519.SH`` / ``000001.SZ``
             - ``0700.HK`` / ``700.HK`` → ``0700.HK``
             - ``AAPL`` → ``AAPL.US``
 
@@ -47,6 +48,13 @@ class SymbolNormalizer:
         if not symbol:
             return ""
 
+        # 处理以 sh/sz/bj 开头的 A 股代码（akshare 行情快照格式）
+        exchange_prefix = cls._extract_exchange_prefix(symbol)
+        if exchange_prefix:
+            code = symbol[2:]
+            if re.fullmatch(r"\d{6}", code):
+                return cls._format_with_exchange(code, exchange_prefix)
+
         # 已包含后缀时，统一后缀命名
         if "." in symbol:
             code, suffix = symbol.rsplit(".", 1)
@@ -60,6 +68,14 @@ class SymbolNormalizer:
 
         # 无后缀时，根据代码特征推断交易所
         return cls._infer_exchange(symbol)
+
+    @classmethod
+    def _extract_exchange_prefix(cls, symbol: str) -> str:
+        """检查代码是否以 sh/sz/bj 交易所前缀开头。"""
+        for prefix in ("SH", "SZ", "BJ"):
+            if symbol.startswith(prefix):
+                return prefix
+        return ""
 
     @classmethod
     def normalize_list(cls, symbols: list[str]) -> list[str]:

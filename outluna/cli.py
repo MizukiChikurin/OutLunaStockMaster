@@ -19,6 +19,7 @@ def main():
         print("\n可用命令：")
         print("  list    - 列出策略")
         print("  scan    - 策略扫描")
+        print("  select  - 超短线风控选股")
         print("  analyze - 分析股票")
         print("  reports - 列出报告")
         print("  quit    - 退出")
@@ -38,6 +39,9 @@ def main():
                 elif action == "scan":
                     strategy = parts[1] if len(parts) > 1 else "十字星"
                     print(await engine.scan(strategy))
+                elif action == "select":
+                    requirements = " ".join(parts[1:]) if len(parts) > 1 else ""
+                    print(await engine.select_stocks(requirements))
                 elif action == "analyze":
                     symbol = parts[1] if len(parts) > 1 else "600519"
                     print(await engine.analyze(symbol))
