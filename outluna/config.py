@@ -20,19 +20,19 @@ class Settings(BaseSettings):
         case_sensitive=False,
     )
 
-    # 项目目录
-    project_dir: Path = Field(default_factory=lambda: Path(__file__).parent.parent.parent)
+    # 项目目录（包含 outluna 包的目录：源项目根目录或 AstrBot 插件目录）
+    project_dir: Path = Field(default_factory=lambda: Path(__file__).parent.parent)
 
     # 数据缓存
     cache_dir: Path = Field(default=Path("./data/cache"))
     cache_ttl_hours: int = Field(default=24)
 
-    # 报告存储
-    report_dir: Path = Field(default=Path("./data/reports"))
+    # 报告存储（已废弃 data/reports，统一使用 data/tasks）
     db_path: Path = Field(default=Path("./data/outluna.db"))
 
     # 数据源配置
     prefer_kimi_datasource: bool = Field(default=True)
+    prefer_kimi_api: bool = Field(default=False)
     kimi_datasource_home: Path = Field(default=Path("E:\\kimi-datasource"))
     akshare_enabled: bool = Field(default=True)
     yfinance_enabled: bool = Field(default=True)
@@ -53,8 +53,9 @@ class Settings(BaseSettings):
     def model_post_init(self, __context: Any) -> None:
         """确保关键目录存在。"""
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self.report_dir.mkdir(parents=True, exist_ok=True)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        # 报告统一保存到 data/tasks，不再创建 data/reports
+        (self.project_dir / "data" / "tasks").mkdir(parents=True, exist_ok=True)
 
 
 # 全局配置实例

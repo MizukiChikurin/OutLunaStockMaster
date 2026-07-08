@@ -87,3 +87,27 @@ class DataProvider:
     def get_a_share_spot(self) -> pd.DataFrame:
         """获取 A 股全市场实时行情快照。"""
         return pd.DataFrame()
+
+    def get_announcements(self, symbol: str, days: int = 30) -> pd.DataFrame:
+        """获取公司公告。"""
+        return pd.DataFrame()
+
+    def get_forecast(self, symbol: str) -> pd.DataFrame:
+        """获取业绩预测。"""
+        return pd.DataFrame()
+
+    def get_company_risk(self, company_full_name: str) -> dict[str, Any]:
+        """获取企业风险。"""
+        return {}
+
+    def get_dragon_tiger(self, symbol: str, days: int = 5) -> pd.DataFrame:
+        """获取龙虎榜数据。"""
+        return pd.DataFrame()
+
+    def get_margin_balance(self, symbol: str, days: int = 20) -> pd.DataFrame:
+        """获取融资融券余额。"""
+        return pd.DataFrame()
+
+    def get_northbound_flow(self, symbol: str, days: int = 20) -> pd.DataFrame:
+        """获取北向资金流向。"""
+        return pd.DataFrame()

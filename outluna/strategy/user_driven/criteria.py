@@ -49,14 +49,16 @@ class UserStrategyConfig:
     min_recommend_score: float = 85.0
     # 观察股最低分
     min_watch_score: float = 60.0
-    # 最大分析股票数（控制成本）
-    max_analyze: int = 20
+    # 最大分析股票数：0 表示分析股票池粗筛后的全部股票；正数表示按成交额排序后取前 N 只
+    max_analyze: int = 100
     # 用户原始要求文本
     original_requirements: str = ""
     # 任务标签，用于生成文件夹名：策略-日期
     task_label: str = ""
     # 数据源优先级：spot/tech/history/flow/news
     required_data_sources: list[str] = field(default_factory=lambda: ["spot", "tech"])
+    # LLM 生成的快照初筛 Python 代码（仅使用 akshare 快照字段）
+    screening_code: str = ""
 
     @property
     def total_weight(self) -> float:

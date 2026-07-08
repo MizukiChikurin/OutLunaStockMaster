@@ -6,16 +6,21 @@
 
 from __future__ import annotations
 
+import json
 import time
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any, cast
 
+import numpy as np
 import pandas as pd
 
+from outluna.config import settings
 from outluna.data.gateway import DataGateway
 from outluna.data.models import DataCall, ExecutionTrace, ScanResult
 from outluna.data.providers.akshare_provider import AkShareProvider
-from outluna.data.providers.kimi_provider import KimiDataSourceProvider
+from outluna.data.providers.kimi_api_provider import KimiApiDataSourceProvider
+from outluna.data.providers.kimi_provider import KimiAuthError, KimiDataSourceProvider
 from outluna.strategy.user_driven.criteria import (
     FilterRule,
     ScoreDimension,
@@ -56,7 +61,9 @@ class StrategyExecutor:
         self.gateway = gateway
         self.config = config
         self.ak_provider = self._get_provider(AkShareProvider)
-        self.kimi_provider = self._get_provider(KimiDataSourceProvider)
+        self.kimi_provider = self._get_provider(
+            (KimiDataSourceProvider, KimiApiDataSourceProvider)
+        )
         self.trace = trace or ExecutionTrace()
         self._step_counter = 0
 
@@ -91,8 +98,10 @@ class StrategyExecutor:
             )
         )
 
-    def _get_provider(self, provider_cls: type) -> Any:
+    def _get_provider(self, provider_cls: type | tuple[type, ...]) -> Any:
         """从网关获取指定类型的数据提供商。"""
+        if isinstance(provider_cls, type):
+            provider_cls = (provider_cls,)
         for provider in self.gateway.providers.values():
             if isinstance(provider, provider_cls):
                 return provider
@@ -115,13 +124,27 @@ class StrategyExecutor:
         stocks = self._build_stock_data(spot_df)
         self.trace.add_count("构建 StockData", len(stocks))
 
-        # 3. 应用股票池粗筛
-        stocks = self._apply_pool_filters(stocks)
-        self.trace.add_count("股票池粗筛后", len(stocks), "应用 pool_filters 条件")
+        # 3. 应用股票池粗筛：优先使用 LLM 生成的快照初筛代码，失败则回退到 pool_filters
+        if self.config.screening_code.strip():
+            stocks, method = self._apply_screening_code(stocks, spot_df)
+        else:
+            stocks = self._apply_pool_filters(stocks)
+            method = "pool_filters"
+
+        # 托底：粗筛后股票池为空时，回退到全部股票，避免分析中断
+        if not stocks:
+            logger.warning("初筛后股票池为空，回退到全部股票")
+            stocks = self._build_stock_data(spot_df)
+            method = "all_fallback"
+
+        self._save_screening_result(stocks, method=method)
+        self.trace.add_count("股票池粗筛后", len(stocks), "应用初筛条件")
 
         # 4. 按成交额排序并限制分析数量
         stocks = self._limit_analyze_scope(stocks)
-        self.trace.add_count("进入详细分析", len(stocks), f"按成交额排序，取前 {self.config.max_analyze} 只")
+        max_analyze = self.config.max_analyze
+        scope_note = "分析全部粗筛后股票" if max_analyze <= 0 else f"按成交额排序，取前 {max_analyze} 只"
+        self.trace.add_count("进入详细分析", len(stocks), scope_note)
 
         # 5. 获取并填充技术指标
         self.trace.add_phase("阶段2", "获取实时技术指标", {"数据源": "stock_finance_data / Kimi Datasource", "批次": "每次最多3只"})
@@ -182,8 +205,8 @@ class StrategyExecutor:
     def _get_spot(self) -> pd.DataFrame:
         """获取 A 股快照。"""
         start = time.perf_counter()
-        try:
-            if self.ak_provider:
+        if self.ak_provider:
+            try:
                 df = cast(pd.DataFrame, self.ak_provider.get_a_share_spot())
                 self._record_call(
                     phase="阶段1",
@@ -194,7 +217,22 @@ class StrategyExecutor:
                     elapsed_seconds=time.perf_counter() - start,
                 )
                 return df
-            # 没有 akshare 时尝试网关降级
+            except Exception as exc:
+                elapsed = time.perf_counter() - start
+                self._record_call(
+                    phase="阶段1",
+                    provider="akshare",
+                    method="get_a_share_spot",
+                    symbols=[],
+                    status="失败",
+                    result_summary=str(exc),
+                    elapsed_seconds=elapsed,
+                )
+                logger.warning(f"akshare 获取 A 股快照失败，回退到 gateway：{exc}")
+
+        # akshare 不存在或失败时回退到 gateway
+        start = time.perf_counter()
+        try:
             df = self.gateway.get_a_share_spot()
             self._record_call(
                 phase="阶段1",
@@ -208,7 +246,7 @@ class StrategyExecutor:
         except Exception as exc:
             self._record_call(
                 phase="阶段1",
-                provider="akshare",
+                provider="gateway",
                 method="get_a_share_spot",
                 symbols=[],
                 status="失败",
@@ -238,10 +276,177 @@ class StrategyExecutor:
         return stocks
 
     def _apply_pool_filters(self, stocks: list[StockData]) -> list[StockData]:
-        """应用股票池粗筛条件。"""
+        """应用声明式股票池粗筛条件。"""
         if not self.config.pool_filters:
             return stocks
         return [s for s in stocks if self._matches_all_rules(s, self.config.pool_filters)]
+
+    def _apply_screening_code(self, stocks: list[StockData], spot_df: pd.DataFrame) -> tuple[list[StockData], str]:
+        """执行 LLM 生成的快照初筛 Python 代码，失败或结果为空时回退到 pool_filters。
+
+        返回 (筛选后的股票列表, 使用的方法标识)。
+        """
+        start = time.perf_counter()
+        try:
+            codes = self._run_screening_code(spot_df, self.config.screening_code)
+            code_set = {str(c).strip() for c in codes if c}
+            elapsed = time.perf_counter() - start
+            self._record_call(
+                phase="阶段1",
+                provider="llm_generated_code",
+                method="screening_code",
+                symbols=[],
+                params={"code": self.config.screening_code[:200]},
+                status="成功",
+                result_summary=f"LLM 初筛代码执行成功，保留 {len(code_set)} 只股票",
+                elapsed_seconds=elapsed,
+            )
+            self.trace.add_note(f"使用 LLM 生成的快照初筛代码，保留 {len(code_set)} 只股票")
+
+            if not code_set:
+                logger.warning("LLM 初筛代码返回空结果，使用默认快照粗筛")
+                codes = self._default_snapshot_screening(spot_df)
+                code_set = {c for c in codes if c}
+                self.trace.add_note(f"LLM 初筛代码返回空，使用默认快照粗筛，保留 {len(code_set)} 只股票")
+                if not code_set:
+                    return self._apply_pool_filters(stocks), "pool_filters_fallback"
+                return [s for s in stocks if self._stock_code_in_set(s, code_set)], "default_screening"
+
+            filtered = [s for s in stocks if self._stock_code_in_set(s, code_set)]
+            return filtered, "screening_code"
+        except Exception as exc:
+            elapsed = time.perf_counter() - start
+            self._record_call(
+                phase="阶段1",
+                provider="llm_generated_code",
+                method="screening_code",
+                symbols=[],
+                params={"code": self.config.screening_code[:200]},
+                status="失败",
+                result_summary=str(exc),
+                elapsed_seconds=elapsed,
+            )
+            logger.warning(f"LLM 初筛代码执行失败，使用默认快照粗筛：{exc}")
+            self.trace.add_note(f"LLM 初筛代码执行失败，使用默认快照粗筛：{exc}")
+            codes = self._default_snapshot_screening(spot_df)
+            code_set = {c for c in codes if c}
+            if not code_set:
+                return self._apply_pool_filters(stocks), "pool_filters_fallback"
+            return [s for s in stocks if self._stock_code_in_set(s, code_set)], "default_screening"
+
+    def _save_screening_result(self, stocks: list[StockData], *, method: str) -> None:
+        """将初筛阶段结果保存到 data/tasks/{task_label}/初筛结果.json。
+
+        无论通过 screening_code 还是 pool_filters 进行初筛，都会保存，便于回溯。
+        """
+        try:
+            label = self.config.task_label or "用户选股"
+            date_str = datetime.now().strftime("%Y.%m.%d")
+            project_dir = Path(str(settings.project_dir))
+            task_folder = project_dir / "data" / "tasks" / f"{label}-{date_str}"
+            task_folder.mkdir(parents=True, exist_ok=True)
+            result_path = task_folder / "初筛结果.json"
+
+            codes = []
+            for s in stocks:
+                raw = s.symbol.split(".")[0] if s.symbol else ""
+                codes.append(raw)
+
+            data = {
+                "task_label": label,
+                "timestamp": datetime.now().isoformat(),
+                "method": method,
+                "code_count": len(codes),
+                "codes": sorted(codes),
+            }
+            if self.config.screening_code.strip():
+                data["screening_code"] = self.config.screening_code
+            else:
+                data["pool_filters"] = [
+                    {"field": r.field, "op": r.op, "value": r.value, "description": r.description}
+                    for r in self.config.pool_filters
+                ]
+
+            result_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            logger.info(f"初筛结果已保存：{result_path}，共 {len(codes)} 只股票")
+            self.trace.add_note(f"初筛结果已保存：{result_path}，共 {len(codes)} 只股票")
+        except Exception as exc:
+            logger.error(f"保存初筛结果失败：{exc}", exc_info=True)
+            self.trace.add_note(f"保存初筛结果失败：{exc}")
+
+    def _run_screening_code(self, spot_df: pd.DataFrame, code: str) -> list[str]:
+        """在受限命名空间中执行 LLM 生成的 Python 代码，返回标准化后的股票代码列表。
+
+        允许访问 pandas/numpy 和传入的 df；内置函数使用白名单，避免危险操作。
+        返回的代码统一使用 SymbolNormalizer 标准化为内部格式（如 600519.SH），
+        避免列类型为整数时前导零丢失导致匹配失败。
+        """
+        safe_builtins = {
+            "len": len,
+            "range": range,
+            "enumerate": enumerate,
+            "zip": zip,
+            "int": int,
+            "float": float,
+            "str": str,
+            "bool": bool,
+            "list": list,
+            "dict": dict,
+            "set": set,
+            "tuple": tuple,
+            "abs": abs,
+            "min": min,
+            "max": max,
+            "sum": sum,
+            "round": round,
+            "sorted": sorted,
+            "isinstance": isinstance,
+            "hasattr": hasattr,
+            "getattr": getattr,
+            "__import__": __import__,
+        }
+        namespace = {
+            "__builtins__": safe_builtins,
+            "pd": pd,
+            "np": np,
+            "df": spot_df.copy(),
+        }
+        exec(code, namespace)  # noqa: S102
+        result = namespace.get("result", [])
+
+        if isinstance(result, pd.DataFrame):
+            if "代码" not in result.columns:
+                raise ValueError("screening_code 返回的 DataFrame 缺少 '代码' 列")
+            codes = [SymbolNormalizer.normalize(str(c)) for c in result["代码"].tolist() if c]
+        elif isinstance(result, pd.Series):
+            codes = [SymbolNormalizer.normalize(str(c)) for c in result.tolist() if c]
+        elif isinstance(result, (list, tuple, set)):
+            codes = [SymbolNormalizer.normalize(str(c)) for c in result if c]
+        else:
+            raise ValueError(f"screening_code 返回的 result 类型不支持：{type(result)}")
+
+        logger.info(f"LLM 初筛代码返回 {len(codes)} 只股票，示例：{codes[:5]}")
+        return codes
+
+    def _default_snapshot_screening(self, spot_df: pd.DataFrame) -> list[str]:
+        """LLM 初筛代码失效时的默认快照粗筛。
+
+        仅使用快照字段做最基础过滤：价格有效、成交额大于 1 亿、排除极端涨跌幅、
+        按成交额排序取前 200 只。
+        """
+        df = spot_df.copy()
+        df = df[df["最新价"].notna() & (df["最新价"] > 0)]
+        df = df[df["成交额"].notna() & (df["成交额"] > 1e8)]
+        df = df[(df["涨跌幅"] >= -9) & (df["涨跌幅"] <= 9)]
+        df = df[(df["最新价"] >= 2) & (df["最新价"] <= 200)]
+        df = df.sort_values("成交额", ascending=False).head(200)
+        codes = [SymbolNormalizer.normalize(str(c)) for c in df["代码"].tolist() if c]
+        logger.info(f"默认快照粗筛返回 {len(codes)} 只股票")
+        return codes
+
+    def _stock_code_in_set(self, stock: StockData, code_set: set[str]) -> bool:
+        """判断股票标准化代码是否在初筛结果集合中。"""
+        return stock.symbol in code_set
 
     def _matches_all_rules(self, stock: StockData, rules: list[FilterRule]) -> bool:
         """判断股票是否满足所有规则（规则满足为通过）。"""
@@ -251,8 +456,13 @@ class StrategyExecutor:
         return True
 
     def _limit_analyze_scope(self, stocks: list[StockData]) -> list[StockData]:
-        """按成交额排序并限制分析数量。"""
+        """按成交额排序并限制分析数量。
+
+        当 ``max_analyze <= 0`` 时分析全部股票，否则取前 ``max_analyze`` 只。
+        """
         stocks = sorted(stocks, key=lambda s: s.get("turnover", 0) or 0, reverse=True)
+        if self.config.max_analyze <= 0:
+            return stocks
         max_n = max(1, self.config.max_analyze)
         return stocks[:max_n]
 
@@ -300,6 +510,19 @@ class StrategyExecutor:
                         elapsed_seconds=elapsed,
                     )
             except Exception as exc:
+                # 凭证错误需要向上传播，由策略层触发刷新重试
+                if isinstance(exc, KimiAuthError):
+                    self._record_call(
+                        phase="阶段2",
+                        provider="stock_finance_data",
+                        method="get_stock_realtime_price (realtime_tech)",
+                        symbols=batch,
+                        params={"indicator": "MA"},
+                        status="凭证过期",
+                        result_summary=str(exc),
+                        elapsed_seconds=time.perf_counter() - start,
+                    )
+                    raise
                 self._record_call(
                     phase="阶段2",
                     provider="stock_finance_data",

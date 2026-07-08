@@ -11,7 +11,8 @@ from outluna.config import settings
 from outluna.data.cache import DataCache
 from outluna.data.providers import DataProvider
 from outluna.data.providers.akshare_provider import AkShareProvider
-from outluna.data.providers.kimi_provider import KimiDataSourceProvider
+from outluna.data.providers.kimi_api_provider import KimiApiDataSourceProvider
+from outluna.data.providers.kimi_provider import KimiAuthError, KimiDataSourceProvider
 from outluna.data.providers.yfinance_provider import YFinanceProvider
 from outluna.utils.logger import setup_logging
 from outluna.utils.symbol import SymbolNormalizer
@@ -76,6 +77,11 @@ class DataGateway:
     def _build_default_providers(self) -> dict[str, DataProvider]:
         """构建默认数据提供商集合。"""
         providers: dict[str, DataProvider] = {}
+        if settings.prefer_kimi_api:
+            try:
+                providers["kimi_api"] = KimiApiDataSourceProvider()
+            except Exception as exc:
+                logger.warning(f"Kimi API 数据源初始化失败：{exc}")
         if settings.prefer_kimi_datasource:
             try:
                 providers["kimi"] = KimiDataSourceProvider()
@@ -92,6 +98,10 @@ class DataGateway:
             except Exception as exc:
                 logger.warning(f"yfinance 初始化失败：{exc}")
         return providers
+
+    def _get_kimi_provider(self) -> DataProvider | None:
+        """返回当前启用的 Kimi 数据源提供商（API 优先）。"""
+        return self.providers.get("kimi_api") or self.providers.get("kimi")
 
     def _rate_limit(self, provider_name: str) -> None:
         """简单的调用频率控制。"""
@@ -119,6 +129,7 @@ class DataGateway:
     ) -> Any:
         """按优先级调用各 provider，失败或返回空结果则降级。"""
         last_exception: Exception | None = None
+        auth_error: KimiAuthError | None = None
         for name, provider in self.providers.items():
             method = getattr(provider, method_name, None)
             if not method:
@@ -135,6 +146,13 @@ class DataGateway:
                     continue
                 self._record_call(name, True, time.time() - start)
                 return result
+            except KimiAuthError as exc:
+                duration = time.time() - start if "start" in locals() else 0
+                self._record_call(name, False, duration)
+                logger.warning(f"[{name}] {method_name} Kimi 凭证错误：{exc}")
+                auth_error = exc
+                last_exception = exc
+                continue
             except Exception as exc:
                 duration = time.time() - start if "start" in locals() else 0
                 self._record_call(name, False, duration)
@@ -142,6 +160,9 @@ class DataGateway:
                 last_exception = exc
                 continue
 
+        # 所有 provider 均失败，若期间发生 Kimi 凭证错误，优先抛出该错误以触发自动刷新
+        if auth_error is not None:
+            raise auth_error
         error_msg = f"所有数据提供商调用失败：{method_name}"
         if last_exception:
             raise RuntimeError(f"{error_msg}，最后错误：{last_exception}")
@@ -247,21 +268,21 @@ class DataGateway:
             return {}
 
         # 优先使用 Kimi 的批量接口，降低成本
-        if "kimi" in self.providers:
-            kimi = self.providers["kimi"]
-            method = getattr(kimi, "get_ohlcv_multi", None)
+        kimi_provider = self._get_kimi_provider()
+        if kimi_provider is not None:
+            method = getattr(kimi_provider, "get_ohlcv_multi", None)
             if method:
                 try:
-                    self._rate_limit("kimi")
+                    self._rate_limit(kimi_provider.name)
                     start = time.time()
                     batch_result = cast(
                         dict[str, pd.DataFrame],
                         method(symbols, period, start_date, end_date, bars, adjust),
                     )
-                    self._record_call("kimi", True, time.time() - start)
+                    self._record_call(kimi_provider.name, True, time.time() - start)
                     return batch_result
                 except Exception as exc:
-                    self._record_call("kimi", False, 0.0)
+                    self._record_call(kimi_provider.name, False, 0.0)
                     logger.warning(f"Kimi 批量 K 线调用失败，降级为逐只调用：{exc}")
 
         # 降级：逐个 provider 逐只获取
@@ -278,16 +299,17 @@ class DataGateway:
         if not symbols:
             return pd.DataFrame()
 
-        if "kimi" in self.providers and len(symbols) <= 3:
-            return self.providers["kimi"].get_realtime_price(symbols)
+        kimi_provider = self._get_kimi_provider()
+        if kimi_provider is not None and len(symbols) <= 3:
+            return kimi_provider.get_realtime_price(symbols)
 
         # 分批调用 Kimi，每次最多 3 只
         results = []
         for i in range(0, len(symbols), 3):
             batch = symbols[i : i + 3]
-            if "kimi" in self.providers:
+            if kimi_provider is not None:
                 try:
-                    df = self.providers["kimi"].get_realtime_price(batch)
+                    df = kimi_provider.get_realtime_price(batch)
                     results.append(df)
                     continue
                 except Exception as exc:
@@ -307,9 +329,10 @@ class DataGateway:
         results = []
         for i in range(0, len(symbols), 3):
             batch = symbols[i : i + 3]
-            if "kimi" in self.providers:
+            kimi_provider = self._get_kimi_provider()
+            if kimi_provider is not None:
                 try:
-                    df = self.providers["kimi"].get_realtime_tech(batch, indicator)
+                    df = kimi_provider.get_realtime_tech(batch, indicator)
                     results.append(df)
                     continue
                 except Exception as exc:
@@ -391,10 +414,10 @@ class DataGateway:
 
     def get_company_risk(self, company_full_name: str) -> dict[str, Any]:
         """查询企业风险。"""
-        if "kimi" not in self.providers:
+        kimi_provider = self._get_kimi_provider()
+        if kimi_provider is None:
             raise RuntimeError("Kimi Datasource 未启用，无法查询企业风险")
-        kim = self.providers["kimi"]
-        method = getattr(kim, "get_company_risk", None)
+        method = getattr(kimi_provider, "get_company_risk", None)
         if not method:
             raise RuntimeError("Kimi Datasource 未实现企业风险查询")
         return cast(dict[str, Any], method(company_full_name))

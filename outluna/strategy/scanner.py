@@ -7,6 +7,7 @@ import pandas as pd
 
 from outluna.data.gateway import DataGateway
 from outluna.data.models import ScanReport, ScanResult
+from outluna.data.providers.kimi_provider import KimiAuthError
 from outluna.strategy.base import StrategyBase
 from outluna.utils.logger import setup_logging
 
@@ -41,6 +42,41 @@ class StockScanner:
         # 默认获取 A 股列表
         return self.gateway.get_stock_list("A")
 
+    def _extract_provider_reason(self, exc: Exception) -> tuple[str, str]:
+        """从异常消息中提取数据提供商名称和失败原因。
+
+        参数:
+            exc: ``get_ohlcv`` 调用失败时抛出的异常。
+
+        返回:
+            一个元组，第一个元素为 provider 名称（如 ``kimi_api``、``kimi``、
+            ``akshare``、``yfinance`` 或 ``unknown``），第二个元素为失败原因描述。
+        """
+        msg = str(exc)
+        if "所有数据提供商调用失败：" in msg:
+            parts = msg.split("最后错误：", 1)
+            if len(parts) == 2:
+                reason = parts[1].strip()
+            else:
+                reason = "所有数据提供商均失败"
+        else:
+            reason = msg
+
+        lower_reason = reason.lower()
+        if "kimi_api" in lower_reason or "kimi api" in lower_reason or "oauth" in lower_reason:
+            provider = "kimi_api"
+        elif "kimi_datasource" in lower_reason or "kimi datasource" in lower_reason:
+            provider = "kimi"
+        elif "kimi" in lower_reason:
+            provider = "kimi"
+        elif "akshare" in lower_reason:
+            provider = "akshare"
+        elif "yfinance" in lower_reason:
+            provider = "yfinance"
+        else:
+            provider = "unknown"
+        return provider, reason
+
     def _fetch_ohlcv_batch(
         self,
         symbols: list[str],
@@ -51,6 +87,8 @@ class StockScanner:
 
         优先调用数据网关的批量接口（Kimi Datasource 每次最多 10 只），
         若批量接口不可用则自动降级为逐只获取。
+        逐只获取时，若连续 3 只股票均无法获取到有效数据，则抛出 RuntimeError
+        终止选股流程，并汇总各数据提供商的失败原因。
         """
         req = self.strategy.required_data
 
@@ -78,6 +116,9 @@ class StockScanner:
 
         # 降级：逐只获取
         result: dict[str, pd.DataFrame] = {}
+        consecutive_failures = 0
+        failure_reasons: dict[str, str] = {}
+
         for symbol in symbols:
             try:
                 df = self.gateway.get_ohlcv(
@@ -89,9 +130,34 @@ class StockScanner:
                     adjust=req.adjust,
                 )
                 if not df.empty and len(df) >= req.bars:
+                    # 成功获取到有效 K 线，重置连续失败计数器
                     result[symbol] = df
+                    consecutive_failures = 0
+                else:
+                    # 数据为空或不足最小 K 线数，视为一次失败
+                    consecutive_failures += 1
+                    failure_reasons.setdefault("empty", "返回数据为空或不足")
+                    if consecutive_failures >= 3:
+                        break
             except Exception as inner_exc:
+                # 如果是 Kimi 授权错误，直接向上抛出以触发登录授权流程
+                if isinstance(inner_exc, KimiAuthError):
+                    raise
+                # 所有数据提供商均失败，记录失败原因并累计失败次数
                 print(f"获取 {symbol} K 线失败：{inner_exc}")
+                provider, reason = self._extract_provider_reason(inner_exc)
+                failure_reasons[provider] = reason
+                consecutive_failures += 1
+                if consecutive_failures >= 3:
+                    break
+
+        if consecutive_failures >= 3:
+            # 连续失败达到 3 只，整理错误信息并抛出 RuntimeError
+            lines = [f"- {provider}: {reason}" for provider, reason in failure_reasons.items()]
+            error_msg = "选股失败：连续 3 只股票数据获取失败。原因汇总：\n" + "\n".join(lines)
+            error_msg += "\n请检查 Kimi API 凭证或数据源网络状态。"
+            raise RuntimeError(error_msg)
+
         return result
 
     async def scan(

@@ -238,7 +238,7 @@ class ScanReport:
         return "\n".join(lines)
 
     def _format_selection_text(self, max_items: int = 20) -> str:
-        """格式化超短线选股报告。"""
+        """格式化超短线选股报告：只展示推荐候选及推荐理由。"""
         lines = [
             f"# {self.strategy_name}报告",
             "",
@@ -253,45 +253,27 @@ class ScanReport:
             lines.append(self.market_summary)
             lines.append("")
 
-        if self.vetoed:
-            lines.append(f"## 一票否决（共 {len(self.vetoed)} 只）")
-            for idx, item in enumerate(self.vetoed[:max_items], 1):
+        if self.qualified:
+            lines.append(f"## 推荐候选（共 {len(self.qualified)} 只）")
+            for idx, item in enumerate(self.qualified[:max_items], 1):
                 lines.append(
                     f"{idx}. {item.symbol} {item.name} | "
                     f"最新价：{item.price:.2f} 涨跌：{item.change_pct:+.2f}% "
                     f"成交额：{item.turnover:.2f}亿"
                 )
-                lines.append(f"   原因：{'；'.join(item.vetos)}")
-            if len(self.vetoed) > max_items:
-                lines.append(f"... 还有 {len(self.vetoed) - max_items} 只")
-            lines.append("")
-
-        if self.qualified:
-            lines.append(f"## 推荐候选（评分≥85分，共 {len(self.qualified)} 只）")
-            for idx, item in enumerate(self.qualified[:max_items], 1):
-                lines.append(
-                    f"{idx}. {item.symbol} {item.name} | 总分：{item.match_score:.0f} | "
-                    f"最新价：{item.price:.2f} 涨跌：{item.change_pct:+.2f}% "
-                    f"成交额：{item.turnover:.2f}亿"
-                )
-                lines.append(f"   分项：{item.score_details}")
-                lines.append(f"   亮点：{' | '.join(item.notes[:3])}")
+                reasons: list[str] = []
+                if item.vetos:
+                    reasons.extend(item.vetos)
+                if item.notes:
+                    reasons.extend(item.notes)
+                if reasons:
+                    lines.append(f"   推荐理由：{' | '.join(reasons[:3])}")
+            if len(self.qualified) > max_items:
+                lines.append(f"... 还有 {len(self.qualified) - max_items} 只")
             lines.append("")
         else:
             lines.append("## 推荐候选")
-            lines.append("无评分≥85分的股票。")
-            lines.append("")
-
-        if self.watch_list:
-            lines.append(f"## 观察股（60-84分，共 {len(self.watch_list)} 只）")
-            for idx, item in enumerate(self.watch_list[:max_items], 1):
-                lines.append(
-                    f"{idx}. {item.symbol} {item.name} | 总分：{item.match_score:.0f} | "
-                    f"最新价：{item.price:.2f} 涨跌：{item.change_pct:+.2f}% "
-                    f"成交额：{item.turnover:.2f}亿"
-                )
-            if len(self.watch_list) > max_items:
-                lines.append(f"... 还有 {len(self.watch_list) - max_items} 只")
+            lines.append("无符合推荐条件的股票。")
             lines.append("")
 
         if self.final_conclusion:

@@ -1,4 +1,3 @@
-import json
 import re
 from dataclasses import dataclass
 from datetime import datetime
@@ -8,7 +7,7 @@ from typing import Any
 from jinja2 import Environment, FileSystemLoader
 
 from outluna.config import settings
-from outluna.data.models import AnalysisReport, BacktestReport, DataCall, ScanReport
+from outluna.data.models import AnalysisReport, BacktestReport, ScanReport
 from outluna.data.storage import SQLiteStorage
 
 
@@ -16,10 +15,10 @@ from outluna.data.storage import SQLiteStorage
 class ReportPaths:
     """报告保存后的路径集合。"""
 
-    json: Path
-    md: Path
-    html: Path
-    txt: Path
+    json: Path | None
+    md: Path | None
+    html: Path | None
+    txt: Path | None
     task_folder: Path | None = None
     summary_md: Path | None = None
     detailed_md: Path | None = None
@@ -41,42 +40,27 @@ def _sanitize_folder_name(name: str) -> str:
 
 
 class ReportStorage:
-    """报告存储管理。"""
+    """报告存储管理。报告文件统一保存到 data/tasks 目录，不再使用 data/reports。"""
 
-    def __init__(self, report_dir: Path | None = None, db_storage: SQLiteStorage | None = None):
-        self.report_dir = report_dir or settings.report_dir
-        self.report_dir.mkdir(parents=True, exist_ok=True)
+    def __init__(self, base_dir: Path | None = None, db_storage: SQLiteStorage | None = None):
+        self.base_dir = base_dir or settings.project_dir / "data" / "tasks"
+        self.base_dir.mkdir(parents=True, exist_ok=True)
         self.db = db_storage or SQLiteStorage()
         template_dir = Path(__file__).parent / "templates"
         self._env = Environment(loader=FileSystemLoader(str(template_dir)), autoescape=False)
 
     def save(self, report: AnalysisReport | ScanReport | BacktestReport) -> ReportPaths:
-        """保存报告为 JSON、Markdown、HTML 和 TXT，并写入数据库索引。"""
-        data = self._serialize(report)
+        """将报告写入数据库索引，并生成任务文件夹（选股报告）。"""
+        # 不再生成 .json/.md/.html/.txt 文件，相关功能和任务文件夹中的总结.md 重复
+        # 仅保留数据库索引与任务文件夹
         paths = ReportPaths(
-            json=self.report_dir / f"{report.report_id}.json",
-            md=self.report_dir / f"{report.report_id}.md",
-            html=self.report_dir / f"{report.report_id}.html",
-            txt=self.report_dir / f"{report.report_id}.txt",
+            json=None,
+            md=None,
+            html=None,
+            txt=None,
         )
 
-        with open(paths.json, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, default=str, indent=2)
-
-        md_content = self._to_markdown(report)
-        with open(paths.md, "w", encoding="utf-8") as f:
-            f.write(md_content)
-
-        html_content = self._render_html(report, data)
-        if html_content:
-            with open(paths.html, "w", encoding="utf-8") as f:
-                f.write(html_content)
-
-        txt_content = self._to_text(report)
-        with open(paths.txt, "w", encoding="utf-8") as f:
-            f.write(txt_content)
-
-        self._save_to_db(report, str(paths.json))
+        self._save_to_db(report, "")
 
         # 选股报告额外生成任务文件夹：总结 + 详细流程
         if isinstance(report, ScanReport) and report.task_folder:
@@ -84,10 +68,20 @@ class ReportStorage:
 
         return paths
 
+    def load(self, report_id: str) -> dict[str, Any] | None:
+        """加载报告。已废弃文件式存储，直接返回 None。"""
+        logger = __import__("outluna.utils.logger", fromlist=["setup_logging"]).setup_logging()
+        logger.debug(f"load({report_id}) 已废弃，返回 None")
+        return None
+
+    def list_reports(self, report_type: str | None = None) -> list[dict[str, Any]]:
+        """列出所有报告。"""
+        return self.db.list_reports(report_type)
+
     def _save_task_folder(self, report: ScanReport) -> tuple[Path, Path, Path]:
         """生成任务文件夹，包含总结.md 和 详细流程.md。"""
         folder_name = _sanitize_folder_name(report.task_folder)
-        task_folder = self.report_dir.parent / "tasks" / folder_name
+        task_folder = self.base_dir / folder_name
         task_folder.mkdir(parents=True, exist_ok=True)
 
         summary_path = task_folder / "总结.md"
@@ -104,7 +98,7 @@ class ReportStorage:
         return task_folder, summary_path, detailed_path
 
     def _build_summary(self, report: ScanReport) -> str:
-        """构建总结报告：只显示结果。"""
+        """构建总结报告：只展示推荐候选及推荐理由。"""
         lines = [
             f"# {report.strategy_name} - 总结报告",
             "",
@@ -121,39 +115,24 @@ class ReportStorage:
             lines.append("")
 
         if report.qualified:
-            lines.append(f"## 推荐候选（评分≥{self._min_score(report):.0f}分，共 {len(report.qualified)} 只）")
+            lines.append(f"## 推荐候选（共 {len(report.qualified)} 只）")
             for idx, item in enumerate(report.qualified, 1):
                 lines.append(
                     f"{idx}. {item.symbol} {item.name} | "
-                    f"总分：{item.match_score:.0f} | "
                     f"最新价：{item.price:.2f} 涨跌：{item.change_pct:+.2f}% "
                     f"成交额：{item.turnover:.2f}亿"
                 )
+                reasons: list[str] = []
+                if item.vetos:
+                    reasons.extend(item.vetos)
                 if item.notes:
-                    lines.append(f"   亮点：{' | '.join(item.notes[:3])}")
+                    reasons.extend(item.notes)
+                if reasons:
+                    lines.append(f"   推荐理由：{' | '.join(reasons[:3])}")
             lines.append("")
         else:
             lines.append("## 推荐候选")
             lines.append("无符合推荐条件的股票。")
-            lines.append("")
-
-        if report.watch_list:
-            lines.append(f"## 观察股（共 {len(report.watch_list)} 只）")
-            for idx, item in enumerate(report.watch_list, 1):
-                lines.append(
-                    f"{idx}. {item.symbol} {item.name} | "
-                    f"总分：{item.match_score:.0f} | "
-                    f"最新价：{item.price:.2f} 涨跌：{item.change_pct:+.2f}% "
-                    f"成交额：{item.turnover:.2f}亿"
-                )
-            lines.append("")
-
-        if report.vetoed:
-            lines.append(f"## 一票否决（共 {len(report.vetoed)} 只）")
-            for idx, item in enumerate(report.vetoed[:20], 1):
-                lines.append(f"{idx}. {item.symbol} {item.name} | 原因：{'；'.join(item.vetos[:3])}")
-            if len(report.vetoed) > 20:
-                lines.append(f"... 还有 {len(report.vetoed) - 20} 只")
             lines.append("")
 
         if report.final_conclusion:
@@ -168,6 +147,8 @@ class ReportStorage:
 
     def _build_detailed_process(self, report: ScanReport) -> str:
         """构建详细流程报告：记录每一步调用的接口和股票。"""
+        from outluna.data.models import DataCall
+
         trace = report.execution_trace
         lines = [
             f"# {report.strategy_name} - 详细流程",
@@ -223,6 +204,7 @@ class ReportStorage:
                     symbols = ", ".join(call.symbols[:10]) or "-"
                     if len(call.symbols) > 10:
                         symbols += f" 等{len(call.symbols)}只"
+                    import json
                     params = json.dumps(call.params, ensure_ascii=False) if call.params else "-"
                     lines.append(
                         f"| {idx} | {call.provider} | {call.method} | {symbols} | {params} | "
@@ -246,19 +228,11 @@ class ReportStorage:
         lines.append("")
         lines.append(f"- 进入详细分析：{report.total_scanned} 只")
         lines.append(f"- 推荐候选：{len(report.qualified)} 只")
-        lines.append(f"- 观察股：{len(report.watch_list)} 只")
-        lines.append(f"- 一票否决：{len(report.vetoed)} 只")
         lines.append("")
         lines.append(
             "> ⚠️ AI生成，不构成投资建议。股市有风险，投资需谨慎。"
         )
         return "\n".join(lines)
-
-    def _min_score(self, report: ScanReport) -> float:
-        """获取推荐最低分。"""
-        if report.qualified:
-            return min(r.match_score for r in report.qualified)
-        return 85.0
 
     def _save_to_db(self, report: AnalysisReport | ScanReport | BacktestReport, report_path: str) -> None:
         """将报告元数据写入数据库。"""
@@ -304,21 +278,6 @@ class ReportStorage:
                 total_trades=report.metrics.total_trades,
                 result_path=report_path,
             )
-
-    def load(self, report_id: str) -> dict[str, Any] | None:
-        """加载报告。"""
-        json_path = self.report_dir / f"{report_id}.json"
-        if not json_path.exists():
-            return None
-        with open(json_path, encoding="utf-8") as f:
-            data = json.load(f)
-            if isinstance(data, dict):
-                return data
-            return None
-
-    def list_reports(self, report_type: str | None = None) -> list[dict[str, Any]]:
-        """列出所有报告。"""
-        return self.db.list_reports(report_type)
 
     def _serialize(self, report: AnalysisReport | ScanReport | BacktestReport) -> dict[str, Any]:
         """序列化报告。"""
@@ -460,7 +419,7 @@ class ReportStorage:
                 "",
             ]
             for idx, match in enumerate(report.matches, 1):
-                lines.append(f"{idx}. {match.symbol}（匹配度：{match.match_score:.2f}）")
+                lines.append(f"{idx}. {match.symbol}")
             return "\n".join(lines)
 
         elif isinstance(report, BacktestReport):
@@ -526,11 +485,13 @@ class ReportGenerator:
         self.storage = storage or ReportStorage()
 
     def save(self, report: AnalysisReport | ScanReport | BacktestReport) -> str:
-        """保存报告并返回 txt 报告路径。"""
+        """保存报告并返回任务文件夹路径（选股报告）或空字符串。"""
         paths = self.storage.save(report)
         if paths.detailed_md:
             return str(paths.detailed_md)
-        return str(paths.txt)
+        if paths.summary_md:
+            return str(paths.summary_md)
+        return ""
 
     def load(self, report_id: str) -> dict[str, Any] | None:
         """加载报告。"""

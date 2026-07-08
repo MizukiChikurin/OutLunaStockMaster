@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 from typing import Any, cast
 
 from outluna.data.models import DataRequirement, ExecutionTrace, ScanReport, ScanResult
+from outluna.data.providers.kimi_provider import KimiAuthError
 from outluna.llm.base import LLMProvider
 from outluna.strategy.base import StrategyBase, registry
 from outluna.strategy.user_driven.criteria import UserStrategyConfig
@@ -26,12 +28,16 @@ class UserDrivenStrategy(StrategyBase):
     description = "根据用户提供的选股要求，自动解析并严格执行筛选。"
     version = "1.0"
 
-    EXECUTE_TIMEOUT_SECONDS = 55
+    BASE_TIMEOUT_SECONDS = 60
+    MAX_TIMEOUT_SECONDS = 3600
+
+    AUTH_REFRESH_WAIT_SECONDS = 8
 
     def __init__(self, params: dict | None = None):
         self.requirements_text: str = ""
         self.config: UserStrategyConfig | None = None
         self.llm_provider: LLMProvider | None = None
+        self.on_auth_error: Callable[[str], Awaitable[None]] | None = None
         super().__init__(params)
 
     def _apply_params(self) -> None:
@@ -41,6 +47,18 @@ class UserDrivenStrategy(StrategyBase):
             self.requirements_text = str(self.params["requirements_text"])
         if "llm_provider" in self.params:
             self.llm_provider = self.params["llm_provider"]
+        if "on_auth_error" in self.params:
+            self.on_auth_error = self.params["on_auth_error"]
+
+    def _compute_timeout(self, max_analyze: int) -> int:
+        """根据分析范围动态计算执行超时。
+
+        全量分析（max_analyze <= 0）给最大超时；按数量分析则按每只股票约 3 秒估算。
+        """
+        if max_analyze <= 0:
+            return self.MAX_TIMEOUT_SECONDS
+        estimated = max_analyze * 3 + 30
+        return max(self.BASE_TIMEOUT_SECONDS, min(self.MAX_TIMEOUT_SECONDS, estimated))
 
     def match(self, symbol: str, df) -> bool:
         """本策略不走传统单只匹配流程。"""
@@ -59,28 +77,44 @@ class UserDrivenStrategy(StrategyBase):
         parser = UserRequirementParser(self.llm_provider)
         self.config = await parser.parse(self.requirements_text)
 
-        # 安全边界：即使 LLM 输出较大值也强制限制
-        self.config.max_analyze = max(1, min(self.config.max_analyze, 50))
+        # 安全边界：正数时强制限制不超过 100；0 表示不限制，保持为 0
+        if self.config.max_analyze > 0:
+            self.config.max_analyze = max(1, min(self.config.max_analyze, 100))
 
-        executor = StrategyExecutor(gateway, self.config)
-        try:
-            results = await asyncio.wait_for(
-                asyncio.to_thread(executor.execute),
-                timeout=self.EXECUTE_TIMEOUT_SECONDS,
-            )
-        except TimeoutError as exc:
-            raise RuntimeError(
-                f"选股执行超时（>{self.EXECUTE_TIMEOUT_SECONDS}秒），"
-                "请缩小范围或稍后重试"
-            ) from exc
+        execute_timeout = self._compute_timeout(self.config.max_analyze)
 
-        return {
-            "results": results,
-            "config": self.config,
-            "execution_trace": executor.trace,
-            "data_time": datetime.now().strftime("%Y-%m-%d 15:00:00"),
-            "data_source": "akshare + stock_finance_data（按用户要求执行）",
-        }
+        for attempt in range(2):
+            executor = StrategyExecutor(gateway, self.config)
+            try:
+                results = await asyncio.wait_for(
+                    asyncio.to_thread(executor.execute),
+                    timeout=execute_timeout,
+                )
+                return {
+                    "results": results,
+                    "config": self.config,
+                    "execution_trace": executor.trace,
+                    "data_time": datetime.now().strftime("%Y-%m-%d 15:00:00"),
+                    "data_source": "akshare + stock_finance_data（按用户要求执行）",
+                }
+            except KimiAuthError as exc:
+                if attempt == 0 and self.on_auth_error is not None:
+                    logger = __import__("outluna.utils.logger", fromlist=["setup_logging"]).setup_logging()
+                    logger.warning(f"Kimi 凭证过期，尝试刷新（第 {attempt + 1} 次）：{exc}")
+                    await self.on_auth_error(str(exc))
+                    await asyncio.sleep(self.AUTH_REFRESH_WAIT_SECONDS)
+                    continue
+                raise RuntimeError(
+                    f"Kimi 凭证刷新后仍然无效：{exc}。请检查 /kimi login 是否成功。"
+                ) from exc
+            except TimeoutError as exc:
+                raise RuntimeError(
+                    f"选股执行超时（>{execute_timeout}秒），"
+                    "请缩小范围或稍后重试"
+                ) from exc
+
+        # 循环正常结束仅可能为第二次 KimiAuthError 已抛出，此处兜底防止 mypy 警告
+        raise RuntimeError("选股执行异常：Kimi 凭证刷新失败")
 
     async def evaluate_batch(self, data: dict[str, Any]) -> list[ScanResult]:
         """返回执行结果并暂存报告元数据。"""

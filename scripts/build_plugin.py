@@ -164,6 +164,12 @@ def build_plugin():
     (target / "data").mkdir(exist_ok=True)
     (target / "logs").mkdir(exist_ok=True)
 
+    # 2.1 复制插件配置模板（如果存在）
+    config_source = root / "data" / "outluna_config.json"
+    config_target = target / "data" / "outluna_config.json"
+    if config_source.exists():
+        shutil.copy2(config_source, config_target)
+
     # 3. 生成 AstrBot 插件入口 main.py
     #    直接复制 outluna/bot/star_plugin.py，使 OutLunaPlugin 类定义在 main 模块中
     _generate_main_entry(target)
