@@ -9,7 +9,6 @@ from __future__ import annotations
 import json
 import time
 from datetime import datetime, timedelta
-from pathlib import Path
 from typing import Any, cast
 
 import numpy as np
@@ -23,7 +22,6 @@ from outluna.data.providers.kimi_api_provider import KimiApiDataSourceProvider
 from outluna.data.providers.kimi_provider import KimiAuthError, KimiDataSourceProvider
 from outluna.strategy.user_driven.criteria import (
     FilterRule,
-    ScoreDimension,
     UserStrategyConfig,
 )
 from outluna.utils.logger import setup_logging
@@ -66,6 +64,7 @@ class StrategyExecutor:
         )
         self.trace = trace or ExecutionTrace()
         self._step_counter = 0
+        self._screening_error: str | None = None
 
     def _next_step(self) -> int:
         """获取下一个步骤编号。"""
@@ -164,8 +163,8 @@ class StrategyExecutor:
         else:
             self.trace.add_phase("阶段4", "跳过资金流向数据", {"原因": "规则中未使用资金流字段"})
 
-        # 8. 一票否决、硬性入选、评分
-        self.trace.add_phase("阶段5", "执行一票否决、硬性入选与多维度评分")
+        # 8. 一票否决、硬性入选
+        self.trace.add_phase("阶段5", "执行一票否决与硬性入选")
         results: list[ScanResult] = []
         for stock in stocks:
             result = self._evaluate_stock(stock)
@@ -198,8 +197,6 @@ class StrategyExecutor:
         all_rules.extend(self.config.pool_filters)
         all_rules.extend(self.config.veto_rules)
         all_rules.extend(self.config.entry_rules)
-        for dim in self.config.score_dimensions:
-            all_rules.extend(dim.rules)
         return any(rule.field in fields for rule in all_rules)
 
     def _get_spot(self) -> pd.DataFrame:
@@ -316,6 +313,8 @@ class StrategyExecutor:
             return filtered, "screening_code"
         except Exception as exc:
             elapsed = time.perf_counter() - start
+            error_msg = f"{type(exc).__name__}: {exc}"
+            self._screening_error = error_msg
             self._record_call(
                 phase="阶段1",
                 provider="llm_generated_code",
@@ -323,7 +322,7 @@ class StrategyExecutor:
                 symbols=[],
                 params={"code": self.config.screening_code[:200]},
                 status="失败",
-                result_summary=str(exc),
+                result_summary=error_msg,
                 elapsed_seconds=elapsed,
             )
             logger.warning(f"LLM 初筛代码执行失败，使用默认快照粗筛：{exc}")
@@ -342,8 +341,7 @@ class StrategyExecutor:
         try:
             label = self.config.task_label or "用户选股"
             date_str = datetime.now().strftime("%Y.%m.%d")
-            project_dir = Path(str(settings.project_dir))
-            task_folder = project_dir / "data" / "tasks" / f"{label}-{date_str}"
+            task_folder = (settings.data_dir or settings.project_dir / "data") / "tasks" / f"{label}-{date_str}"
             task_folder.mkdir(parents=True, exist_ok=True)
             result_path = task_folder / "初筛结果.json"
 
@@ -358,6 +356,7 @@ class StrategyExecutor:
                 "method": method,
                 "code_count": len(codes),
                 "codes": sorted(codes),
+                "screening_error": self._screening_error,
             }
             if self.config.screening_code.strip():
                 data["screening_code"] = self.config.screening_code
@@ -381,6 +380,12 @@ class StrategyExecutor:
         返回的代码统一使用 SymbolNormalizer 标准化为内部格式（如 600519.SH），
         避免列类型为整数时前导零丢失导致匹配失败。
         """
+        try:
+            import akshare as ak
+        except Exception as exc:
+            logger.warning(f"screening_code 需要 akshare，但导入失败：{exc}")
+            ak = None
+
         safe_builtins = {
             "len": len,
             "range": range,
@@ -405,12 +410,15 @@ class StrategyExecutor:
             "getattr": getattr,
             "__import__": __import__,
         }
-        namespace = {
+        namespace: dict[str, Any] = {
             "__builtins__": safe_builtins,
             "pd": pd,
             "np": np,
             "df": spot_df.copy(),
         }
+        if ak is not None:
+            namespace["ak"] = ak
+
         exec(code, namespace)  # noqa: S102
         result = namespace.get("result", [])
 
@@ -705,7 +713,7 @@ class StrategyExecutor:
 
 
     def _evaluate_stock(self, stock: StockData) -> ScanResult:
-        """评估单只股票：否决、入选、评分。"""
+        """评估单只股票：仅执行一票否决和硬性入选，不生成量化评分。"""
         price = stock.get("price", 0) or 0
         change_pct = stock.get("change_pct", 0) or 0
         turnover = stock.get("turnover", 0) or 0
@@ -722,35 +730,25 @@ class StrategyExecutor:
 
         passed = not vetos and not entry_failures
 
-        # 评分：没有评分维度时，所有通过硬性条件的股票视为候选，不参与打分
-        score_details: dict[str, float] = {}
         notes: list[str] = []
-        total_score = 0.0
-        scored = False
+        if passed:
+            notes.append("通过一票否决与硬性入选条件，作为候选股票")
+        else:
+            notes.append("未通过一票否决或硬性入选条件")
 
-        if passed and self.config.score_dimensions:
-            scored = True
-            for dim in self.config.score_dimensions:
-                dim_score, dim_notes = self._score_dimension(stock, dim)
-                score_details[dim.name] = dim_score
-                notes.extend(dim_notes)
-                total_score += dim_score
-        elif passed:
-            notes.append("用户未提供评分标准，仅按硬性条件筛选，不做量化评分")
-
-        recommendation = self._determine_recommendation(vetos, entry_failures, total_score, scored)
+        recommendation = self._determine_recommendation(vetos, entry_failures)
 
         return ScanResult(
             symbol=stock.symbol,
             strategy_name=self.config.name,
             matched_at=datetime.now(),
-            match_score=total_score if scored else -1.0,
+            match_score=-1.0,
             trigger_data={"price": price, "change_pct": change_pct, "turnover": turnover},
             name=stock.name,
             price=price,
             change_pct=change_pct,
             turnover=turnover / 1e8 if turnover else 0,
-            score_details=score_details,
+            score_details={},
             notes=notes,
             vetos=vetos + entry_failures,
             recommendation=recommendation,
@@ -813,44 +811,17 @@ class StrategyExecutor:
 
         return True
 
-    def _score_dimension(self, stock: StockData, dim: ScoreDimension) -> tuple[float, list[str]]:
-        """对单个维度评分。
-
-        如果维度没有规则，则该维度不贡献分数（返回 0），避免所有股票得分一致。
-        """
-        if not dim.rules:
-            return 0.0, []
-
-        passed = 0
-        notes: list[str] = []
-        for rule in dim.rules:
-            if self._evaluate_rule(stock, rule):
-                passed += 1
-                if rule.description:
-                    notes.append(rule.description)
-
-        score = dim.weight * (passed / len(dim.rules))
-        return round(score, 2), notes
-
     def _determine_recommendation(
         self,
         vetos: list[str],
         entry_failures: list[str],
-        score: float,
-        scored: bool,
     ) -> str:
-        """确定结论。"""
+        """确定结论：通过所有条件的股票标记为候选，否则剔除。"""
         if vetos:
             return "剔除"
         if entry_failures:
             return "剔除"
-        if not scored:
-            return "候选"
-        if score >= self.config.min_recommend_score:
-            return "推荐"
-        if score >= self.config.min_watch_score:
-            return "观察"
-        return "剔除"
+        return "候选"
 
     @staticmethod
     def _to_float(value: Any) -> float | None:

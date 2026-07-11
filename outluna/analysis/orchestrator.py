@@ -1,6 +1,7 @@
 """分析编排器。"""
 
 from datetime import datetime
+from typing import Any
 from uuid import uuid4
 
 import pandas as pd
@@ -12,6 +13,7 @@ from outluna.analysis.fundamentals import FundamentalsAnalyzer
 from outluna.analysis.institutional import InstitutionalAnalyzer
 from outluna.analysis.llm_analyst import LLMAnalyst
 from outluna.analysis.sentiment import SentimentAnalyzer
+from outluna.analysis.technical import TechnicalAnalyzer
 from outluna.data.gateway import DataGateway
 from outluna.data.models import AnalysisReport, AnalyzerResult
 
@@ -27,31 +29,35 @@ class AnalysisOrchestrator:
         gateway: DataGateway,
         analyzers: list[AnalyzerBase] | None = None,
         enable_llm: bool = True,
+        llm_provider: Any | None = None,
     ):
         self.gateway = gateway
-        self.analyzers = analyzers or self._default_analyzers(gateway, enable_llm)
+        self.analyzers = analyzers or self._default_analyzers(gateway, enable_llm, llm_provider)
 
     def _default_analyzers(
-        self, gateway: DataGateway, enable_llm: bool
+        self,
+        gateway: DataGateway,
+        enable_llm: bool,
+        llm_provider: Any | None = None,
     ) -> list[AnalyzerBase]:
         """默认分析器组合。"""
         analyzers: list[AnalyzerBase] = [
             FundamentalsAnalyzer(gateway),
             CompanyAnalyzer(gateway),
             InstitutionalAnalyzer(gateway),
+            TechnicalAnalyzer(gateway),
             SentimentAnalyzer(gateway),
         ]
         if enable_llm:
-            analyzers.append(LLMAnalyst(gateway))
+            analyzers.append(LLMAnalyst(gateway, llm_provider=llm_provider))
         return analyzers
 
     async def analyze(self, symbol: str, strategy_name: str = "") -> AnalysisReport:
         """执行完整分析流程。
 
-        按配置顺序执行各分析器，汇总多维度评分。
+        按配置顺序执行各分析器，汇总各维度关键信号。
         若启用 LLM，则由 LLMAnalyst 生成结构化投资建议；
-        若未启用 LLM，则使用规则化综合方法生成风险等级与投资建议，
-        确保即使不配置 LLM，分析报告也不会缺失关键结论。
+        若未启用 LLM，则使用规则化综合方法生成风险等级与投资建议。
         """
         context = AnalysisContext(symbol=symbol)
 
@@ -74,7 +80,6 @@ class AnalysisOrchestrator:
         risk_rating = ""
         recommendation = ""
         if final_llm_result:
-            # 优先使用 LLM 输出的结构化风险等级
             recommendation = final_llm_result.summary
             for signal in final_llm_result.signals:
                 if signal.startswith("风险等级："):
@@ -83,10 +88,9 @@ class AnalysisOrchestrator:
             if not risk_rating:
                 risk_rating = final_llm_result.data.get("risk_rating", "")
         else:
-            # 未启用 LLM 时，基于各维度平均分生成规则化结论
-            avg_score = self._calculate_average_score(context.results)
-            risk_rating = self._risk_rating_by_score(avg_score)
-            recommendation = self._build_rule_based_recommendation(avg_score, context.results)
+            # 未启用 LLM 时，基于规则生成结论
+            risk_rating = self._rule_risk_rating(context.results)
+            recommendation = self._build_rule_based_recommendation(context.results)
 
         return AnalysisReport(
             report_id=str(uuid4())[:8],
@@ -99,35 +103,43 @@ class AnalysisOrchestrator:
             recommendation=recommendation,
         )
 
-    def _calculate_average_score(self, results: dict[str, AnalyzerResult]) -> float:
-        """计算各维度平均评分。"""
-        scores = [r.score for r in results.values() if r.score is not None]
-        if not scores:
-            return 50.0
-        return sum(scores) / len(scores)
-
-    @staticmethod
-    def _risk_rating_by_score(score: float) -> str:
-        """根据综合评分划分风险等级。"""
-        if score >= 75:
+    def _rule_risk_rating(self, results: dict[str, AnalyzerResult]) -> str:
+        """基于信号数量给出风险等级。"""
+        positive = 0
+        negative = 0
+        for result in results.values():
+            for signal in result.signals:
+                if any(word in signal for word in ["失败", "亏损", "偏高", "负面", "偏弱", "净流出"]):
+                    negative += 1
+                elif any(word in signal for word in ["良好", "为正", "合理", "正面", "偏强", "净流入"]):
+                    positive += 1
+        if positive > negative + 2:
             return "中低风险"
-        if score >= 60:
+        if positive > negative:
             return "中等风险"
-        if score >= 40:
-            return "中高风险"
-        return "高风险"
+        if negative > positive + 2:
+            return "高风险"
+        return "中高风险"
 
     def _build_rule_based_recommendation(
-        self, avg_score: float, results: dict[str, AnalyzerResult]
+        self, results: dict[str, AnalyzerResult]
     ) -> str:
         """未启用 LLM 时，基于规则生成投资建议摘要。"""
-        parts = [f"综合评分 {avg_score:.0f}/100，"]
-        if avg_score >= 75:
-            parts.append("多维度存在积极信号，可作为重点关注标的。")
-        elif avg_score >= 60:
-            parts.append("存在部分积极信号，但需进一步观察确认，建议谨慎跟踪。")
+        positive_signals = 0
+        negative_signals = 0
+        for result in results.values():
+            for signal in result.signals:
+                if any(word in signal for word in ["失败", "亏损", "偏高", "负面", "偏弱", "净流出"]):
+                    negative_signals += 1
+                elif any(word in signal for word in ["良好", "为正", "合理", "正面", "偏强", "净流入"]):
+                    positive_signals += 1
+
+        if positive_signals > negative_signals + 2:
+            parts = ["多维度存在积极信号，可作为重点关注标的。"]
+        elif positive_signals > negative_signals:
+            parts = ["存在部分积极信号，但需进一步观察确认，建议谨慎跟踪。"]
         else:
-            parts.append("存在较多风险或不确定性信号，建议回避或继续观察。")
+            parts = ["存在较多风险或不确定性信号，建议回避或继续观察。"]
 
         signal_notes = []
         for dimension, result in results.items():

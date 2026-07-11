@@ -11,7 +11,7 @@ from outluna.data.models import AnalyzerResult
 class CompanyAnalyzer(AnalyzerBase):
     """企业画像分析器。
 
-    基于 Kimi Datasource 的公司信息和天眼查数据，评估企业背景与风险。
+    基于 Kimi Datasource 的公司信息和股东数据，提取企业背景与风险信号。
     """
 
     dimension = "company"
@@ -22,7 +22,6 @@ class CompanyAnalyzer(AnalyzerBase):
     async def analyze(self, symbol: str, context: AnalysisContext | None = None) -> AnalyzerResult:
         """执行企业画像分析。"""
         signals: list[str] = []
-        score = 50.0
 
         try:
             company_info = self.gateway.get_company_info(symbol)
@@ -31,12 +30,11 @@ class CompanyAnalyzer(AnalyzerBase):
                 dimension=self.dimension,
                 data={"error": str(exc)},
                 signals=["公司信息获取失败"],
-                score=0,
+                summary="公司信息获取失败，无法完成企业画像分析。",
             )
 
         data: dict[str, Any] = {"company_info": company_info}
 
-        # 公司属性
         name = company_info.get("ths_stock_short_name_stock", "")
         controller = company_info.get("ths_actual_controller_stock", "")
         controller_type = company_info.get("ths_actual_controller_type_stock", "")
@@ -51,14 +49,12 @@ class CompanyAnalyzer(AnalyzerBase):
             signals.append(f"实控人：{controller}")
         controller_type_str = str(controller_type) if controller_type is not None else ""
         if controller_type_str and "国资" in controller_type_str:
-            score += 10
             signals.append(f"实控人为{controller_type_str}，背景较稳")
         if scale:
             signals.append(f"企业规模：{scale}")
         if business:
             signals.append(f"主营业务：{business[:50]}")
 
-        # 股东结构
         try:
             holder_info = self.gateway.get_holder_info(symbol)
             data["holder_info"] = holder_info
@@ -67,14 +63,11 @@ class CompanyAnalyzer(AnalyzerBase):
         except Exception as exc:
             signals.append(f"股东信息获取失败：{exc}")
 
-        summary = f"企业画像评分：{score:.0f}/100。" + (
-            "关键信号：" + "；".join(signals) if signals else "暂无明确信号。"
-        )
+        summary = "关键信号：" + "；".join(signals) if signals else "暂无明确信号。"
 
         return AnalyzerResult(
             dimension=self.dimension,
             data=data,
             signals=signals,
-            score=max(0, min(100, score)),
             summary=summary,
         )

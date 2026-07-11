@@ -15,7 +15,6 @@ from outluna.llm.base import LLMProvider
 from outluna.llm.openai_provider import OpenAILLMProvider
 from outluna.strategy.user_driven.criteria import (
     FilterRule,
-    ScoreDimension,
     UserStrategyConfig,
 )
 from outluna.utils.logger import setup_logging
@@ -64,10 +63,10 @@ class UserStrategyConfigOutput(BaseModel):
     )
     screening_code: str = Field(
         default="",
-        description="仅使用 akshare 实时快照字段的 Python 初筛代码，必须输出 result 变量为股票代码列表或 DataFrame",
+        description="可调用 akshare 接口的 Python 初筛代码，必须输出 result 变量为股票代码列表或 DataFrame",
     )
     min_recommend_score: float = Field(
-        default=85.0, description="推荐最低分",
+        default=0.0, description="推荐最低分，0 表示不强制分数门槛，所有通过初筛的股票均可推荐"
     )
     min_watch_score: float = Field(
         default=60.0, description="观察股最低分",
@@ -127,32 +126,26 @@ class UserRequirementParser:
 - not_in：不在列表中
 """
 
-    SNAPSHOT_FIELD_DOCS = """
-快照可用字段（df 中的列名）说明：
-- '代码': 股票代码（如 '600519'，无交易所后缀）
-- '名称': 股票名称
-- '最新价': 最新价
-- '涨跌幅': 当日涨跌幅（%）
-- '涨跌额': 当日涨跌额
-- '今开': 今开价
-- '最高': 最高价
-- '最低': 最低价
-- '成交量': 当日成交量
-- '成交额': 当日成交额
-- '昨收': 昨收价
-- '买入': 买入价
-- '卖出': 卖出价
-- '时间戳': 数据时间戳
+    AKSHARE_API_DOCS = """
+screening_code 可使用的 akshare 接口（推荐）：
+- ak.stock_zh_a_spot_em(): 全市场 A 股实时行情快照，返回 DataFrame，含列：代码、名称、最新价、涨跌幅、涨跌额、成交量、成交额、量比、换手率等。
+- ak.stock_zh_a_hist(symbol="600519", period="daily", start_date="20260101", end_date="20261231", adjust="qfq"): 个股历史日线，返回 DataFrame，含：日期、开盘、收盘、最高、最低、成交量、成交额、振幅、涨跌幅等。
+- ak.stock_zh_a_hist_min_em(symbol="600519", period="5", adjust="qfq"): 1/5/15/30/60 分钟 K 线。
+- ak.stock_zh_a_minute(symbol="600519"): 当日分时数据。
+- ak.stock_cyq_em(symbol="600519"): 个股筹码分布，返回价格-持仓比例。
+- ak.stock_individual_fund_flow(symbol="600519", market="sh"): 个股主力资金流向。
+- ak.stock_a_lg_indicator(): 龙虎榜数据。
+- ak.stock_individual_info_em(symbol="600519"): 公司基本信息、财务指标。
 
-允许在 screening_code 中基于这些字段计算衍生指标（如振幅、日内位置、涨跌幅分位等），但：
-1. 不得调用 akshare 的其他接口；
-2. 不得访问历史 K 线或技术指标；
-3. 历史/技术指标相关条件请放到 entry_rules/veto_rules/score_dimensions 中，由后续数据源补充。
-
-screening_code 的输出变量 result 必须是以下之一：
-- 股票代码列表，如 ['600519', '000001']；
-- 包含 '代码' 列的 pandas DataFrame；
-- 股票代码的 pandas Series。
+通用要求：
+1. screening_code 是粗筛，用于快速缩小股票池，控制后续数据源调用成本；
+2. 可直接调用上述 akshare 接口，输入参数中的股票代码使用 akshare 格式（如 '600519'，无交易所后缀）；
+3. 输出变量 result 必须是以下之一：
+   - 股票代码列表，如 ['600519', '000001']；
+   - 包含 '代码' 列的 pandas DataFrame；
+   - 股票代码的 pandas Series。
+4. 绝对禁止返回空列表、空 DataFrame 或 result = []；
+5. 若无法使用 akshare 接口精确表达，可将相关条件留到 entry_rules/veto_rules/score_dimensions 中由后续数据源补充。
 """
 
     def __init__(self, llm_provider: LLMProvider | None = None):
@@ -196,34 +189,35 @@ screening_code 的输出变量 result 必须是以下之一：
             "要求：\n"
             "1. 忠实还原用户要求，不添加用户未提及的规则；\n"
             "2. 将条件分类为：股票池粗筛（pool_filters）、一票否决（veto_rules）、"
-            "硬性入选（entry_rules）、评分维度（score_dimensions）；\n"
+            "硬性入选（entry_rules）。不要生成评分维度（score_dimensions），"
+            "即使原要求中包含“评分”“打分”“权重”等字样，也统一将其细化为可执行的硬性入选规则，"
+            "由执行器直接判断通过/不通过，不再做量化评分；\n"
             "   注意：只有用户明确使用“一票否决”“剔除”“排除”等字样要求时才生成 veto_rules，"
             "否则必须将 veto_rules 留空，避免默认剔除股票；\n"
-            "3. 评分维度权重之和应为 100；\n"
-            "4. 只使用下方列出的可用字段和操作符；\n"
-            "5. 若用户要求中某条件无法精确量化，请在 description 中说明，并给出最贴近的量化表达；\n"
-            "6. max_analyze 不得超过 100，默认 100，表示分析股票池粗筛后按成交额排序取前 100 只；"
+            "3. 只使用下方列出的可用字段和操作符；\n"
+            "4. 若用户要求中某条件无法精确量化，请在 description 中说明，并给出最贴近的量化表达；\n"
+            "5. max_analyze 不得超过 100，默认 100，表示分析股票池粗筛后按成交额排序取前 100 只；"
             "只有当用户明确要求全量分析或指定其他数量时才修改；\n"
-            "7. 当用户未明确给出评分维度与细则时，score_dimensions 应设为空数组，"
-            "不要生成空规则的评分维度，避免所有股票得分一致；\n"
-            "8. 止损线/支撑位/密集成交区/散户止损等模糊概念，"
+            "6. 止损线/支撑位/密集成交区/散户止损等模糊概念，"
             "应使用 dist_to_20d_low_pct 或 dist_to_60d_low_pct 等字段量化："
             "例如 'dist_to_20d_low_pct between 0 and 3' 表示价格接近20日低点。\n"
-            "9. 请根据用户要求总结一个简短 task_label（2-6个汉字），"
+            "7. 请根据用户要求总结一个简短 task_label（2-6个汉字），"
             "用于生成报告文件夹名，例如：散户止损、低位启动、量价齐升。\n"
-            "10. 必须生成一段 screening_code（Python 代码），用于在 akshare 实时快照 df 上执行初筛，"
-            "只使用快照字段，不得调用其他接口或访问历史数据。\n"
-            "   - screening_code 是粗筛，不要把所有条件都塞进来；它只需要快速缩小股票池，"
-            "控制后续数据源调用成本；\n"
-            "   - 把用户要求中能用快照字段表达的条件（如成交额、涨跌幅、价格范围、振幅、日内位置）"
-            "放到 screening_code 中；\n"
-            "   - 如果用户要求很复杂，或涉及历史数据/技术指标/散户止损线等无法用快照精确表达的条件，"
-            "screening_code 至少必须做以下基础过滤：剔除无价/零成交、成交额大于一定阈值、"
-            "排除极端涨跌幅、按成交额排序取前 100 或前 200 只；\n"
+            "8. 必须生成一段 screening_code（Python 代码），用于执行初筛并快速缩小股票池。\n"
+            "   - screening_code 可直接调用 akshare 接口（见下方接口列表），\n"
+            "     而不再限于实时快照字段；\n"
+            "   - 它是粗筛，不要把所有条件都塞进来；主要用于快速缩小股票池，\n"
+            "     控制后续数据源调用成本；\n"
+            "   - 把用户要求中能用 akshare 接口快速表达的条件（如成交额、涨跌幅、\n"
+            "     历史均线、资金流向、筹码分布等）放到 screening_code 中；\n"
+            "   - 如果用户要求很复杂，screening_code 至少必须做以下基础过滤：\n"
+            "     剔除无价/零成交、成交额大于一定阈值、排除极端涨跌幅、\n"
+            "     按成交额排序取前 100 或前 200 只；\n"
             "   - 绝对禁止返回空列表、空 DataFrame 或 result = []；\n"
-            "   - 只有确实无法近似的历史/技术指标条件才放到 entry_rules/veto_rules/score_dimensions 中；\n"
+            "   - 只有确实无法使用 akshare 接口表达的条件才放到 entry_rules/veto_rules 中；\n"
             "   - 输出变量 result 必须是股票代码列表或包含 '代码' 列的 DataFrame。\n"
             "   - 示例（复杂要求时的最小化粗筛）：\n"
+            "     df = ak.stock_zh_a_spot_em()\n"
             "     df = df[df['最新价'].notna() & (df['最新价'] > 0)]\n"
             "     df = df[df['成交额'].notna() & (df['成交额'] > 1e8)]\n"
             "     df = df[(df['涨跌幅'] >= -9) & (df['涨跌幅'] <= 9)]\n"
@@ -231,7 +225,7 @@ screening_code 的输出变量 result 必须是以下之一：
             "     df = df.sort_values('成交额', ascending=False).head(100)\n"
             "     result = df['代码'].tolist()\n\n"
             f"{self.FIELD_DOCS}\n\n"
-            f"{self.SNAPSHOT_FIELD_DOCS}\n\n"
+            f"{self.AKSHARE_API_DOCS}\n\n"
             "注意：输出必须是合法 JSON，字段类型严格匹配。"
         )
 
@@ -247,16 +241,12 @@ screening_code 的输出变量 result 必须是以下之一：
             pool_filters=[UserRequirementParser._to_filter_rule(r) for r in output.pool_filters],
             veto_rules=[UserRequirementParser._to_filter_rule(r) for r in output.veto_rules],
             entry_rules=[UserRequirementParser._to_filter_rule(r) for r in output.entry_rules],
-            score_dimensions=[UserRequirementParser._to_score_dimension(d) for d in output.score_dimensions],
-            min_recommend_score=output.min_recommend_score,
-            min_watch_score=output.min_watch_score,
             max_analyze=output.max_analyze,
             required_data_sources=output.required_data_sources,
             original_requirements=requirements_text,
             task_label=output.task_label or UserRequirementParser._guess_task_label(requirements_text),
             screening_code=output.screening_code,
         )
-        config.normalize_weights()
         return config
 
     @staticmethod
@@ -267,16 +257,6 @@ screening_code 的输出变量 result 必须是以下之一：
             op=rule.op,
             value=rule.value,
             description=rule.description,
-        )
-
-    @staticmethod
-    def _to_score_dimension(dim: ScoreDimensionOutput) -> ScoreDimension:
-        """转换评分维度对象。"""
-        return ScoreDimension(
-            name=dim.name,
-            weight=dim.weight,
-            rules=[UserRequirementParser._to_filter_rule(r) for r in dim.rules],
-            description=dim.description,
         )
 
     @staticmethod

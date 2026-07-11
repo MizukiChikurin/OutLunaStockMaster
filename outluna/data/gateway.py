@@ -142,7 +142,7 @@ class DataGateway:
                 if self._is_empty_result(result):
                     duration = time.time() - start
                     self._record_call(name, False, duration)
-                    logger.warning(f"[{name}] {method_name} 返回空结果")
+                    logger.debug(f"[{name}] {method_name} 返回空结果")
                     continue
                 self._record_call(name, True, time.time() - start)
                 return result
@@ -409,6 +409,28 @@ class DataGateway:
         df = self._call_with_fallback_df("get_holder_info", symbol)
         self.cache.set_df(key, df)
         return df
+
+    def get_forecast(self, symbol: str) -> pd.DataFrame:
+        """获取盈利预测。Kimi Datasource 特有接口，不走 fallback。"""
+        symbol = self._normalize_symbol(symbol)
+        kimi_provider = self._get_kimi_provider()
+        if kimi_provider is None:
+            raise RuntimeError("Kimi Datasource 未启用，无法获取盈利预测")
+        method = getattr(kimi_provider, "get_forecast", None)
+        if not method:
+            raise RuntimeError("Kimi Datasource 未实现盈利预测查询")
+        return cast(pd.DataFrame, method(symbol))
+
+    def get_announcements(self, symbol: str, days: int = 30) -> pd.DataFrame:
+        """获取公司公告。Kimi Datasource 特有接口，不走 fallback。"""
+        symbol = self._normalize_symbol(symbol)
+        kimi_provider = self._get_kimi_provider()
+        if kimi_provider is None:
+            raise RuntimeError("Kimi Datasource 未启用，无法获取公司公告")
+        method = getattr(kimi_provider, "get_announcements", None)
+        if not method:
+            raise RuntimeError("Kimi Datasource 未实现公司公告查询")
+        return cast(pd.DataFrame, method(symbol, days=days))
 
     # ==================== 企业风险 ====================
 

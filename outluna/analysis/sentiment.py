@@ -9,8 +9,9 @@ from outluna.data.models import AnalyzerResult
 class SentimentAnalyzer(AnalyzerBase):
     """情绪分析器。
 
-    基于 akshare 获取的新闻数据，做简单的情绪判断。
-    由于 Kimi Datasource 不支持通用 Web 搜索，新闻源由 akshare 补充。
+    以 akshare 新闻数据为主要情绪来源，
+    以 Kimi Datasource 的公司公告作为补充信息源。
+    当新闻源不可用时，以公告数据或中性提示替代。
     """
 
     dimension = "sentiment"
@@ -21,7 +22,6 @@ class SentimentAnalyzer(AnalyzerBase):
     async def analyze(self, symbol: str, context: AnalysisContext | None = None) -> AnalyzerResult:
         """执行情绪分析。"""
         signals: list[str] = []
-        score = 50.0
 
         try:
             news = self.gateway.get_news(symbol, days=7, limit=20)
@@ -30,16 +30,27 @@ class SentimentAnalyzer(AnalyzerBase):
                 dimension=self.dimension,
                 data={"error": str(exc)},
                 signals=["新闻获取失败"],
-                score=50,
+                summary="新闻获取失败，无法完成情绪分析。",
             )
 
-        data = {"news_count": len(news), "news": news[:10]}
+        try:
+            announcements = self.gateway.get_announcements(symbol, days=30)
+        except Exception:
+            announcements = None
+
+        data = {
+            "news_count": len(news),
+            "news": news[:10],
+            "announcements": announcements,
+        }
 
         if not news:
-            signals.append("近期无相关新闻")
+            if announcements is not None and not announcements.empty:
+                signals.append(f"近 30 日公告 {len(announcements)} 条")
+            else:
+                signals.append("近期无相关新闻与公告，情绪中性")
         else:
             signals.append(f"近 7 日相关新闻 {len(news)} 条")
-            # 简单关键词情绪判断
             positive_words = ["增长", "上涨", "利好", "突破", "强劲", "超预期", "回购", "增持"]
             negative_words = ["下跌", "亏损", "利空", "暴雷", "减持", "裁员", "诉讼", "处罚"]
 
@@ -55,22 +66,17 @@ class SentimentAnalyzer(AnalyzerBase):
                         negative_count += 1
 
             if positive_count > negative_count:
-                score += 10
                 signals.append(f"新闻偏正面（正面 {positive_count}，负面 {negative_count}）")
             elif negative_count > positive_count:
-                score -= 10
                 signals.append(f"新闻偏负面（正面 {positive_count}，负面 {negative_count}）")
             else:
                 signals.append("新闻情绪中性")
 
-        summary = f"情绪评分：{score:.0f}/100。" + (
-            "关键信号：" + "；".join(signals) if signals else "暂无明确信号。"
-        )
+        summary = "关键信号：" + "；".join(signals) if signals else "暂无明确信号。"
 
         return AnalyzerResult(
             dimension=self.dimension,
             data=data,
             signals=signals,
-            score=max(0, min(100, score)),
             summary=summary,
         )

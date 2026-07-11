@@ -49,11 +49,12 @@ import outluna
 from outluna.bot.astrbot_llm_provider import AstrBotLLMProvider
 from outluna.bot.commands import CommandHandler
 from outluna.bot.formatter import MessageFormatter
-from outluna.bot.plugin_config import apply_plugin_config
+from outluna.bot.plugin_config import apply_plugin_config, relocate_settings_paths
 from outluna.config import settings
 from outluna.data.providers.kimi_api.models import OAuthUnauthorizedError
 from outluna.data.providers.kimi_api.oauth import KimiOAuthClient
 from outluna.data.providers.kimi_api.storage import KimiCredentialStore
+from outluna.data.watchlist import WatchlistStorage
 from outluna.engine import OutLunaEngine
 from outluna.report.generator import ReportGenerator, ReportStorage
 from outluna.utils.logger import setup_logging
@@ -70,8 +71,20 @@ def _get_kimi_oauth_client() -> KimiOAuthClient:
 def _plugin_data_dir() -> Path:
     """获取插件数据目录。
 
-    源码布局下为项目根目录 data/，插件布局下为插件根目录 data/。
+    AstrBot 运行时使用 ``StarTools.get_data_dir('outluna')`` 获取
+    ``data/plugin_data/outluna`` 目录，避免插件更新导致数据丢失；
+    源码布局或无法获取 AstrBot 目录时回退到本地 ``data/``。
     """
+    if (_plugin_dir / "outluna").exists():
+        # 插件布局：优先使用 AstrBot 提供的插件数据目录
+        try:
+            from astrbot.core.star.star_tools import StarTools  # type: ignore[import-not-found]
+
+            return Path(str(StarTools.get_data_dir("outluna")))
+        except Exception as exc:
+            logger.warning(f"无法获取 AstrBot 插件数据目录，回退到本地 data：{exc}")
+            return _plugin_dir / "data"
+    # 源码布局
     return _project_root / "data"
 
 
@@ -92,18 +105,25 @@ class OutLunaPlugin(star.Star):
     def __init__(self, context: star.Context) -> None:
         super().__init__(context)
         self.context = context
-        # AstrBot 场景下将报告保存到插件自己的 data/tasks 目录
+        # AstrBot 场景下将所有持久化数据重定向到 AstrBot 插件数据目录
         data_dir = _plugin_data_dir()
         tasks_dir = data_dir / "tasks"
         tasks_dir.mkdir(parents=True, exist_ok=True)
-        # 先加载插件私有配置，覆盖全局 settings（如 prefer_kimi_api）
+        # 旧数据目录（插件根目录 data/），用于迁移已有凭证
+        old_data_dir = _plugin_dir / "data" if (_plugin_dir / "outluna").exists() else None
+        # 先重定位文件路径，再加载插件私有配置覆盖全局 settings
+        relocate_settings_paths(data_dir, settings, old_data_dir=old_data_dir)
         apply_plugin_config(data_dir, settings)
+        logger.info(f"OutLuna 插件数据目录：{data_dir}")
+        logger.info(f"Kimi 凭证文件路径：{settings.db_path.parent / 'kimi_api_credentials.json'}")
+        logger.info(f"旧数据目录：{old_data_dir}")
         report_storage = ReportStorage(base_dir=tasks_dir)
         # AstrBot 场景下复用其已配置的 LLM
         self.engine = OutLunaEngine(
             llm_provider=None,
         )
         self.engine.report_generator = ReportGenerator(storage=report_storage)
+        self.engine.watchlist_storage = WatchlistStorage(data_dir / "watchlist.json")
         self.handler = CommandHandler(self.engine)
         self.formatter = MessageFormatter()
 
@@ -263,6 +283,9 @@ class OutLunaPlugin(star.Star):
         """分析指定股票。用法：/analyze 600519"""
         await event.send(_message(f"正在分析 {symbol}，请稍候..."))
         try:
+            llm_provider = self._get_llm_provider(event)
+            logger.info(f"/analyze 使用 AstrBot LLM Provider，可用：{llm_provider.available}")
+            self.engine.llm_provider = llm_provider
             text = await self.engine.analyze(symbol)
             await event.send(_message(self.formatter.truncate(text)))
         except Exception as exc:
@@ -283,6 +306,43 @@ class OutLunaPlugin(star.Star):
         """列出可用策略"""
         text = await self.engine.list_strategies()
         await event.send(_message(text))
+
+    @filter.command("观察")
+    async def add_watch(self, event: AstrMessageEvent, symbol: str):
+        """将股票加入自选股池。用法：/观察 600519"""
+        if not symbol:
+            await event.send(_message("用法：/观察 股票代码\n例如：/观察 600519"))
+            return
+        try:
+            text = await self.engine.add_watch(symbol)
+            await event.send(_message(text))
+        except Exception as exc:
+            await event.send(_message(f"加入自选股池失败：{exc}"))
+
+    @filter.command("放弃观察")
+    async def remove_watch(self, event: AstrMessageEvent, symbol: str):
+        """将股票从自选股池移除。用法：/放弃观察 600519"""
+        if not symbol:
+            await event.send(_message("用法：/放弃观察 股票代码\n例如：/放弃观察 600519"))
+            return
+        try:
+            text = await self.engine.remove_watch(symbol)
+            await event.send(_message(text))
+        except Exception as exc:
+            await event.send(_message(f"移除自选股池失败：{exc}"))
+
+    @filter.command("分析股池")
+    async def analyze_watchlist(self, event: AstrMessageEvent):
+        """分析自选股池中的所有股票。用法：/分析股池"""
+        await event.send(_message("正在分析自选股池，请稍候..."))
+        try:
+            llm_provider = self._get_llm_provider(event)
+            logger.info(f"/分析股池 使用 AstrBot LLM Provider，可用：{llm_provider.available}")
+            self.engine.llm_provider = llm_provider
+            text = await self.engine.analyze_watchlist()
+            await event.send(_message(self.formatter.truncate(text)))
+        except Exception as exc:
+            await event.send(_message(f"分析股池失败：{exc}"))
 
     @filter.command("report")
     async def get_report(self, event: AstrMessageEvent, report_id: str = ""):

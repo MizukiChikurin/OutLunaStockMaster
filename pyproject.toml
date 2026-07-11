@@ -91,6 +91,8 @@ module = [
     "astrbot.api",
     "astrbot.api.*",
     "astrbot.api.event",
+    "astrbot.core",
+    "astrbot.core.*",
 ]
 ignore_missing_imports = true
 

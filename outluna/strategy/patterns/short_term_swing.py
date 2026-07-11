@@ -5,7 +5,7 @@
 2. 清洗股票池，剔除 ST/退市/北交所/新股/停牌等；
 3. 按成交额取前 N 只作为重点分析对象；
 4. 通过 Kimi Datasource 的 realtime_tech 分批获取技术指标；
-5. 执行一票否决与多维度评分；
+5. 执行一票否决与硬性入选；
 6. 输出结构化的超短线选股报告。
 """
 
@@ -27,19 +27,17 @@ from outluna.utils.symbol import SymbolNormalizer
 class ShortTermSwingStrategy(StrategyBase):
     """A股超短线风控选股策略。
 
-    严格按照“先否决、后筛选、再评分、最后给交易计划”的顺序工作，
-    只输出评分≥85分的推荐标的，没有则建议空仓观望。
+    严格按照“先否决、后筛选”的顺序工作，只输出通过所有风控条件的候选标的，
+    不再做量化评分，将原始数据与信号统一交给后续 LLM 或用户自行判断。
     """
 
     name = "超短线风控选股"
-    description = "A股超短线风控选股：先否决、后筛选、再评分，输出低位启动候选股。"
+    description = "A股超短线风控选股：先否决、后筛选，输出低位启动候选股。"
     version = "1.0"
 
     def __init__(self, params: dict | None = None):
         self.top_n: int = 100
         self.min_turnover: float = 150_000_000.0
-        self.score_threshold: float = 85.0
-        self.watch_threshold: float = 60.0
         super().__init__(params)
 
     def match(self, symbol: str, df: pd.DataFrame) -> bool:
@@ -87,7 +85,7 @@ class ShortTermSwingStrategy(StrategyBase):
         }
 
     async def evaluate_batch(self, data: dict[str, Any]) -> list[ScanResult]:
-        """批量执行一票否决与评分，返回所有结果（含被否决与观察股）。"""
+        """批量执行一票否决，返回所有结果（含被否决与候选）。"""
         spot_df: pd.DataFrame = data.get("spot", pd.DataFrame())
         tech_df: pd.DataFrame = data.get("tech", pd.DataFrame())
 
@@ -188,7 +186,7 @@ class ShortTermSwingStrategy(StrategyBase):
         row: pd.Series,
         tech_map: dict[str, pd.Series],
     ) -> ScanResult:
-        """评估单只股票：一票否决 + 评分。"""
+        """评估单只股票：一票否决 + 生成关键信号。"""
         code = str(row["代码"]).strip()
         symbol = SymbolNormalizer.normalize(code)
         name = str(row.get("名称", ""))
@@ -197,26 +195,15 @@ class ShortTermSwingStrategy(StrategyBase):
         turnover = float(row.get("成交额", 0) or 0) / 1e8
 
         tech_row = tech_map.get(symbol)
+        vetos, notes = self._detailed_analysis(row, tech_row)
 
-        vetos, notes, score_details, score = self._detailed_analysis(
-            row, tech_row
-        )
-
-        # 根据评分确定结论
-        if vetos:
-            recommendation = "剔除"
-        elif score >= self.score_threshold:
-            recommendation = "推荐"
-        elif score >= self.watch_threshold:
-            recommendation = "观察"
-        else:
-            recommendation = "剔除"
+        recommendation = "剔除" if vetos else "候选"
 
         return ScanResult(
             symbol=symbol or code,
             strategy_name=self.name,
             matched_at=datetime.now(),
-            match_score=float(score),
+            match_score=-1.0,
             trigger_data={
                 "price": price,
                 "change_pct": change_pct,
@@ -226,7 +213,7 @@ class ShortTermSwingStrategy(StrategyBase):
             price=price,
             change_pct=change_pct,
             turnover=turnover,
-            score_details=score_details,
+            score_details={},
             notes=notes,
             vetos=vetos,
             recommendation=recommendation,
@@ -236,12 +223,10 @@ class ShortTermSwingStrategy(StrategyBase):
         self,
         row: pd.Series,
         tech_row: pd.Series | None,
-    ) -> tuple[list[str], list[str], dict[str, float], float]:
-        """执行一票否决与评分，返回 (否决原因, 备注, 分项得分, 总分)。"""
+    ) -> tuple[list[str], list[str]]:
+        """执行一票否决并提取关键信号，返回 (否决原因, 备注)。"""
         vetos: list[str] = []
         notes: list[str] = []
-        score_details: dict[str, float] = {}
-        total_score = 0.0
 
         price = float(row.get("最新价", 0) or 0)
         change_pct = float(row.get("涨跌幅", 0) or 0)
@@ -251,7 +236,7 @@ class ShortTermSwingStrategy(StrategyBase):
 
         if price <= 0:
             vetos.append("数据无效/停牌")
-            return vetos, notes, score_details, 0
+            return vetos, notes
 
         # ===== 一票否决条件 =====
         if abs(change_pct) >= 19.9:
@@ -264,6 +249,13 @@ class ShortTermSwingStrategy(StrategyBase):
             rsi = self._safe_float(tech_row.get("rsi12"))
             j = self._safe_float(tech_row.get("j"))
             ma60 = self._safe_float(tech_row.get("ma60"))
+            ma5 = self._safe_float(tech_row.get("ma5"))
+            ma10 = self._safe_float(tech_row.get("ma10"))
+            ma20 = self._safe_float(tech_row.get("ma20"))
+            macd = self._safe_float(tech_row.get("macd"))
+            dif = self._safe_float(tech_row.get("dif"))
+            dea = self._safe_float(tech_row.get("dea"))
+            atr14 = self._safe_float(tech_row.get("atr14"))
 
             if rsi is not None and rsi > 80:
                 vetos.append(f"RSI极度超买：{rsi:.2f}")
@@ -274,146 +266,57 @@ class ShortTermSwingStrategy(StrategyBase):
             if ma60 is not None and ma60 > 0 and price > ma60 * 1.3:
                 vetos.append(f"价格极高：{price:.2f} > MA60*1.3={ma60 * 1.3:.2f}")
 
+            if ma60 is not None and ma60 > 0 and price <= ma60 * 1.05:
+                notes.append("价格处于MA60附近或下方，位置相对安全")
+            elif ma60 is not None and ma60 > 0:
+                notes.append("价格高于MA60，注意追高风险")
+
+            if ma5 is not None and price > ma5:
+                notes.append("站上MA5")
+            if ma10 is not None and price > ma10:
+                notes.append("站上MA10")
+            if ma20 is not None and abs(price - ma20) / price < 0.05:
+                notes.append("价格接近MA20")
+
+            if rsi is not None and 40 <= rsi <= 70:
+                notes.append(f"RSI健康({rsi:.1f})")
+
+            if macd is not None and dif is not None and dea is not None:
+                if macd > 0 and dif > dea:
+                    notes.append("MACD金叉且红柱")
+                elif dif > dea:
+                    notes.append("MACD DIF>DEA")
+
+            if atr14 is not None and price > 0:
+                atr_ratio = atr14 / price * 100
+                if atr_ratio >= 3:
+                    notes.append(f"ATR充足({atr_ratio:.2f}%)")
+                elif atr_ratio >= 2:
+                    notes.append(f"ATR一般({atr_ratio:.2f}%)")
+                else:
+                    notes.append(f"ATR不足({atr_ratio:.2f}%)")
+
         # 收盘在日内振幅下半区
         if high > low:
             upper_half = low + (high - low) * 0.5
             if price < upper_half:
                 vetos.append("收盘价位于日内振幅下半区")
 
-        # ===== 评分体系（满分100） =====
-        if vetos:
-            return vetos, notes, score_details, 0
+            if 0 < change_pct <= 3:
+                notes.append(f"当日温和上涨({change_pct:.2f}%)")
+            elif -2 <= change_pct <= 0:
+                notes.append(f"当日微跌/平盘({change_pct:.2f}%)")
 
-        if tech_row is None:
-            notes.append("缺少技术指标数据")
-            return vetos, notes, score_details, 0
-
-        ma5 = self._safe_float(tech_row.get("ma5"))
-        ma10 = self._safe_float(tech_row.get("ma10"))
-        ma20 = self._safe_float(tech_row.get("ma20"))
-        ma60 = self._safe_float(tech_row.get("ma60"))
-        rsi = self._safe_float(tech_row.get("rsi12"))
-        macd = self._safe_float(tech_row.get("macd"))
-        dif = self._safe_float(tech_row.get("dif"))
-        dea = self._safe_float(tech_row.get("dea"))
-        atr14 = self._safe_float(tech_row.get("atr14"))
-
-        # 1. 位置安全度（20分）
-        pos_score = 0.0
-        if ma60 is not None and ma60 > 0:
-            if price <= ma60 * 1.05:
-                pos_score = 20
-                notes.append("价格处于MA60附近或下方，位置安全")
-            elif price <= ma60 * 1.15:
-                pos_score = 15
-                notes.append("位置较安全")
-            elif price <= ma60 * 1.25:
-                pos_score = 10
-            else:
-                pos_score = 5
-        score_details["位置安全度"] = pos_score
-        total_score += pos_score
-
-        # 2. 量价结构（20分）
-        vol_score = 0.0
-        if ma5 is not None and price > ma5:
-            vol_score += 5
-            notes.append("站上MA5")
-        if ma10 is not None and price > ma10:
-            vol_score += 5
-            notes.append("站上MA10")
-        if ma20 is not None and abs(price - ma20) / price < 0.05:
-            vol_score += 5
-            notes.append("价格接近MA20")
-        if ma10 is not None and ma10 > 0:
-            dist = abs(price - ma10) / ma10 * 100
-            if dist <= 12:
-                vol_score += 5
-                notes.append(f"距MA10合理({dist:.1f}%)")
-        score_details["量价结构"] = vol_score
-        total_score += vol_score
-
-        # 3. 技术形态（15分）
-        tech_score = 0.0
-        if rsi is not None:
-            if 40 <= rsi <= 70:
-                tech_score += 8
-                notes.append(f"RSI健康({rsi:.1f})")
-            elif 35 <= rsi <= 75:
-                tech_score += 4
-        if macd is not None and dif is not None and dea is not None:
-            if macd > 0 and dif > dea:
-                tech_score += 7
-                notes.append("MACD金叉且红柱")
-            elif dif > dea:
-                tech_score += 4
-                notes.append("MACD DIF>DEA")
-            elif macd > -0.5:
-                tech_score += 2
-        score_details["技术形态"] = tech_score
-        total_score += tech_score
-
-        # 4. 波动潜力（10分）
-        vol_potential = 0.0
-        if atr14 is not None and price > 0:
-            atr_ratio = atr14 / price * 100
-            if atr_ratio >= 3:
-                vol_potential = 10
-                notes.append(f"ATR充足({atr_ratio:.2f}%)")
-            elif atr_ratio >= 2:
-                vol_potential = 6
-                notes.append(f"ATR一般({atr_ratio:.2f}%)")
-            elif atr_ratio >= 1:
-                vol_potential = 3
-            else:
-                notes.append(f"ATR不足({atr_ratio:.2f}%)")
-        score_details["波动潜力"] = vol_potential
-        total_score += vol_potential
-
-        # 5. 收盘强度（10分）
-        close_score = 0.0
+        # 收盘在日内振幅下半区
         if high > low:
-            range_val = high - low
-            upper_third = low + range_val * 0.67
-            upper_half = low + range_val * 0.5
-            if price >= upper_third:
-                close_score = 10
-                notes.append("收盘在上1/3区")
-            elif price >= upper_half:
-                close_score = 7
-                notes.append("收盘在上半区")
-            elif price >= low + range_val * 0.33:
-                close_score = 4
-        score_details["收盘强度"] = close_score
-        total_score += close_score
+            upper_half = low + (high - low) * 0.5
+            if price < upper_half:
+                vetos.append("收盘价位于日内振幅下半区")
 
-        # 6. 当日表现（10分）
-        day_score = 0.0
-        if 0 < change_pct <= 3:
-            day_score = 10
-            notes.append(f"当日温和上涨({change_pct:.2f}%)")
-        elif -2 <= change_pct <= 0:
-            day_score = 7
-            notes.append(f"当日微跌/平盘({change_pct:.2f}%)")
-        elif 3 < change_pct <= 6:
-            day_score = 5
-        elif -5 <= change_pct < -2:
-            day_score = 3
-        score_details["当日表现"] = day_score
-        total_score += day_score
-
-        # 7. 板块/资金（10分）：数据待补充时给默认分
-        sector_score = 5.0
         notes.append("板块/资金数据待补充")
-        score_details["板块资金"] = sector_score
-        total_score += sector_score
 
-        # 8. 风险排查（5分）
-        risk_score = 5.0
-        score_details["风险排查"] = risk_score
-        total_score += risk_score
+        return vetos, notes
 
-        return vetos, notes, score_details, total_score
 
     def _safe_float(self, value: Any) -> float | None:
         """安全地将值转为浮点数，失败返回 None。"""
@@ -453,15 +356,8 @@ class ShortTermSwingStrategy(StrategyBase):
         """
         results = getattr(self, "_last_results", [])
         vetoed = [r for r in results if r.vetos]
-        passed = [r for r in results if not r.vetos]
-
-        # 按评分排序
-        passed_sorted = sorted(passed, key=lambda x: x.match_score, reverse=True)
-        qualified = [r for r in passed_sorted if r.match_score >= self.score_threshold]
-        watch_list = [
-            r for r in passed_sorted
-            if self.watch_threshold <= r.match_score < self.score_threshold
-        ]
+        qualified = [r for r in results if not r.vetos]
+        watch_list: list[ScanResult] = []
 
         # 构建市场环境概述
         market_summary = self._build_market_summary(results)
@@ -518,7 +414,7 @@ class ShortTermSwingStrategy(StrategyBase):
         """生成最终结论文本。"""
         if qualified:
             lines = [
-                f"推荐 {len(qualified)} 只候选股，评分均≥{self.score_threshold:.0f}分。",
+                f"推荐 {len(qualified)} 只候选股。",
                 "建议结合次日开盘情况、板块强度与资金流向进一步确认买点。",
             ]
             return "\n".join(lines)
@@ -526,10 +422,10 @@ class ShortTermSwingStrategy(StrategyBase):
         lines = [
             "### 空仓/无符合条件标的",
             "",
-            f"没有评分≥{self.score_threshold:.0f}分的股票可推荐。",
+            "没有通过一票否决的股票可推荐。",
             "",
             "原因分析：",
-            "1. 当前重点股票池中多数标的未通过一票否决或评分未达标；",
+            "1. 当前重点股票池中多数标的未通过一票否决；",
             "2. 技术指标显示多数股票处于调整期或波动空间不足；",
             "3. 缺乏明确的低位启动、资金承接强的标的。",
             "",

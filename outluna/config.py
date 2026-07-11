@@ -23,6 +23,9 @@ class Settings(BaseSettings):
     # 项目目录（包含 outluna 包的目录：源项目根目录或 AstrBot 插件目录）
     project_dir: Path = Field(default_factory=lambda: Path(__file__).parent.parent)
 
+    # 数据根目录：CLI 模式下为 project_dir/data，AstrBot 插件模式下为 AstrBot 分配的 plugin_data/outluna
+    data_dir: Path | None = Field(default=None)
+
     # 数据缓存
     cache_dir: Path = Field(default=Path("./data/cache"))
     cache_ttl_hours: int = Field(default=24)
@@ -52,10 +55,14 @@ class Settings(BaseSettings):
 
     def model_post_init(self, __context: Any) -> None:
         """确保关键目录存在。"""
+        if self.data_dir is None:
+            self.data_dir = self.project_dir / "data"
+        self.cache_dir = self.data_dir / "cache"
+        self.db_path = self.data_dir / "outluna.db"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         # 报告统一保存到 data/tasks，不再创建 data/reports
-        (self.project_dir / "data" / "tasks").mkdir(parents=True, exist_ok=True)
+        (self.data_dir / "tasks").mkdir(parents=True, exist_ok=True)
 
 
 # 全局配置实例

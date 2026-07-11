@@ -66,6 +66,10 @@ class ReportStorage:
         if isinstance(report, ScanReport) and report.task_folder:
             paths.task_folder, paths.summary_md, paths.detailed_md = self._save_task_folder(report)
 
+        # 单只股票分析报告也生成任务文件夹
+        if isinstance(report, AnalysisReport):
+            paths.task_folder, paths.summary_md, paths.detailed_md = self._save_analysis_task_folder(report)
+
         return paths
 
     def load(self, report_id: str) -> dict[str, Any] | None:
@@ -234,6 +238,119 @@ class ReportStorage:
         )
         return "\n".join(lines)
 
+    def _save_analysis_task_folder(
+        self, report: AnalysisReport
+    ) -> tuple[Path, Path, Path]:
+        """生成单只股票分析任务文件夹，包含总结.md 和 详细数据.md。"""
+        from datetime import datetime
+
+        folder_name = _sanitize_folder_name(
+            f"分析股票：{report.symbol}-{datetime.now().strftime('%Y%m%d')}"
+        )
+        task_folder = self.base_dir / folder_name
+        task_folder.mkdir(parents=True, exist_ok=True)
+
+        summary_path = task_folder / "总结.md"
+        detailed_path = task_folder / "详细数据.md"
+
+        summary_content = self._build_analysis_summary(report)
+        detailed_content = self._build_analysis_detailed_process(report)
+
+        with open(summary_path, "w", encoding="utf-8") as f:
+            f.write(summary_content)
+        with open(detailed_path, "w", encoding="utf-8") as f:
+            f.write(detailed_content)
+
+        return task_folder, summary_path, detailed_path
+
+    def _build_analysis_summary(self, report: AnalysisReport) -> str:
+        """构建分析报告总结。
+
+        优先使用 LLM 生成的结构化 Markdown 结论（包含公司概况、股价表现、
+        财务亮点、关键财务数据、估值参考、优势与风险、总体评价），
+        若 LLM 未启用则回退到手动拼接的多维度信号展示。
+        """
+        llm_result = report.results.get("llm")
+        if llm_result is not None and llm_result.summary:
+            return llm_result.summary
+
+        lines = [
+            f"# {report.symbol} 投资分析总结",
+            "",
+            f"- 报告ID：{report.report_id}",
+            f"- 生成时间：{report.created_at.strftime('%Y-%m-%d %H:%M:%S')}",
+            f"- 风险等级：{report.risk_rating}",
+            "",
+            "## 投资建议",
+            "",
+            report.recommendation,
+            "",
+            "## 多维度信号",
+            "",
+        ]
+        for dim, result in report.results.items():
+            lines.append(f"- {dim}")
+            if result.signals:
+                lines.append(f"  - {result.signals[0]}")
+        lines.append("")
+        lines.append(
+            "> AI生成，不构成投资建议。股市有风险，投资需谨慎。"
+        )
+        return "\n".join(lines)
+
+    def _build_analysis_detailed_process(self, report: AnalysisReport) -> str:
+        """构建分析详细数据报告。"""
+        lines = [
+            f"# {report.symbol} 投资分析详细数据",
+            "",
+            f"- 报告ID：{report.report_id}",
+            f"- 生成时间：{report.created_at.strftime('%Y-%m-%d %H:%M:%S')}",
+            f"- 风险等级：{report.risk_rating}",
+            "",
+        ]
+        for dim, result in report.results.items():
+            lines.append(f"## {dim}")
+            lines.append("")
+            lines.append(result.summary)
+            lines.append("")
+            if result.signals:
+                lines.append("- " + "\n- ".join(result.signals))
+                lines.append("")
+            data = result.data or {}
+            if data:
+                lines.append("### 原始数据")
+                lines.append("")
+                for key, value in data.items():
+                    if value is None:
+                        continue
+                    if hasattr(value, "empty") and value.empty:
+                        continue
+                    if isinstance(value, dict) and not value:
+                        continue
+                    if isinstance(value, list) and not value:
+                        continue
+                    lines.append(f"**{key}**：")
+                    if hasattr(value, "head"):
+                        lines.append(value.head(10).to_markdown(index=False))
+                    elif isinstance(value, dict):
+                        import json
+                        lines.append(
+                            "```json\n"
+                            + json.dumps(value, ensure_ascii=False, indent=2, default=str)
+                            + "\n```"
+                        )
+                    elif isinstance(value, list):
+                        import json
+                        lines.append(
+                            "```json\n"
+                            + json.dumps(value, ensure_ascii=False, indent=2, default=str)
+                            + "\n```"
+                        )
+                    else:
+                        lines.append(str(value))
+                    lines.append("")
+        return "\n".join(lines)
+
     def _save_to_db(self, report: AnalysisReport | ScanReport | BacktestReport, report_path: str) -> None:
         """将报告元数据写入数据库。"""
         if isinstance(report, ScanReport):
@@ -294,7 +411,6 @@ class ReportStorage:
                 "results": {
                     dim: {
                         "dimension": r.dimension,
-                        "score": r.score,
                         "summary": r.summary,
                         "signals": r.signals,
                     }
@@ -397,7 +513,7 @@ class ReportStorage:
                 "",
             ]
             for dim, result in report.results.items():
-                lines.append(f"### {dim}（评分：{result.score:.0f}/100）")
+                lines.append(f"### {dim}")
                 lines.append("")
                 lines.append(result.summary)
                 lines.append("")

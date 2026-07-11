@@ -33,7 +33,7 @@ class CommandHandler:
         """
         text = text.strip()
         if not text:
-            return "请输入命令。可用命令：/scan、/analyze、/backtest、/report、/compare、/strategy"
+            return "请输入命令。可用命令：/scan、/选股、/analyze、/backtest、/report、/compare、/strategy、/观察、/放弃观察、/分析股池"
 
         if not text.startswith("/"):
             return f"未知输入：{text}\n请以 / 开头输入命令。"
@@ -57,6 +57,12 @@ class CommandHandler:
                 return await self._compare(args)
             if command == "strategy":
                 return await self.engine.list_strategies()
+            if command == "观察":
+                return await self._watch(args)
+            if command == "放弃观察":
+                return await self._unwatch(args)
+            if command == "分析股池":
+                return await self._analyze_watchlist(args)
             if command == "help":
                 return self._help()
             return f"未知命令：/{command}\n{self._help()}"
@@ -109,6 +115,22 @@ class CommandHandler:
             return "用法：/compare <报告ID1> <报告ID2>"
         return await self.engine.compare_reports(args[0], args[1])
 
+    async def _watch(self, args: list[str]) -> str:
+        """处理 /观察 <股票代码> 命令。"""
+        if not args:
+            return "用法：/观察 <股票代码>\n例如：/观察 600519"
+        return await self.engine.add_watch(args[0])
+
+    async def _unwatch(self, args: list[str]) -> str:
+        """处理 /放弃观察 <股票代码> 命令。"""
+        if not args:
+            return "用法：/放弃观察 <股票代码>\n例如：/放弃观察 600519"
+        return await self.engine.remove_watch(args[0])
+
+    async def _analyze_watchlist(self, args: list[str]) -> str:
+        """处理 /分析股池 命令。"""
+        return await self.engine.analyze_watchlist()
+
     def _help(self) -> str:
         """返回帮助文本。"""
         return (
@@ -120,5 +142,8 @@ class CommandHandler:
             "/report [报告ID] - 查看报告\n"
             "/compare <id1> <id2> - 对比报告\n"
             "/strategy - 列出可用策略\n"
+            "/观察 <代码> - 将股票加入自选股池\n"
+            "/放弃观察 <代码> - 将股票从自选股池移除\n"
+            "/分析股池 - 分析自选股池中的所有股票\n"
             "/help - 显示帮助"
         )

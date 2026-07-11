@@ -161,7 +161,6 @@ class AnalyzerResult:
     dimension: str
     data: dict[str, Any] = field(default_factory=dict)
     signals: list[str] = field(default_factory=list)
-    score: float | None = None
     summary: str = ""
 
 

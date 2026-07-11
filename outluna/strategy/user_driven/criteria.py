@@ -19,20 +19,12 @@ class FilterRule:
 
 
 @dataclass
-class ScoreDimension:
-    """评分维度。"""
-
-    name: str
-    weight: float
-    rules: list[FilterRule] = field(default_factory=list)
-    description: str = ""
-
-
-@dataclass
 class UserStrategyConfig:
     """用户选股策略结构化配置。
 
     由 LLM 根据用户自然语言要求解析生成，再由执行器严格执行。
+    选股只做股票池粗筛、一票否决和硬性入选，不生成量化评分，
+    将原始数据与规则结果统一交给 LLM 处理。
     """
 
     name: str = "用户自定义策略"
@@ -41,14 +33,8 @@ class UserStrategyConfig:
     pool_filters: list[FilterRule] = field(default_factory=list)
     # 一票否决：任一条件触发即剔除
     veto_rules: list[FilterRule] = field(default_factory=list)
-    # 硬性入选：必须同时满足才可进入评分
+    # 硬性入选：必须同时满足才可进入候选
     entry_rules: list[FilterRule] = field(default_factory=list)
-    # 评分维度
-    score_dimensions: list[ScoreDimension] = field(default_factory=list)
-    # 推荐最低分
-    min_recommend_score: float = 85.0
-    # 观察股最低分
-    min_watch_score: float = 60.0
     # 最大分析股票数：0 表示分析股票池粗筛后的全部股票；正数表示按成交额排序后取前 N 只
     max_analyze: int = 100
     # 用户原始要求文本
@@ -59,15 +45,3 @@ class UserStrategyConfig:
     required_data_sources: list[str] = field(default_factory=lambda: ["spot", "tech"])
     # LLM 生成的快照初筛 Python 代码（仅使用 akshare 快照字段）
     screening_code: str = ""
-
-    @property
-    def total_weight(self) -> float:
-        """计算评分维度总权重。"""
-        return sum(d.weight for d in self.score_dimensions)
-
-    def normalize_weights(self) -> None:
-        """将权重归一化为满分100。"""
-        total = self.total_weight
-        if total > 0 and total != 100:
-            for dim in self.score_dimensions:
-                dim.weight = dim.weight / total * 100
