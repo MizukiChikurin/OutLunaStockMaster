@@ -61,8 +61,8 @@ from outluna.data.models import ScanReport
 from outluna.data.providers.kimi_api.models import OAuthUnauthorizedError
 from outluna.data.providers.kimi_api.oauth import KimiOAuthClient
 from outluna.data.providers.kimi_api.storage import KimiCredentialStore
-from outluna.data.watchlist import SOURCE_AUTO, WatchlistStorage
-from outluna.engine import OutLunaEngine
+from outluna.data.watchlist import AUTO_KEEP_TRADE_DAYS, WatchlistStorage
+from outluna.engine import OutLunaEngine, ReportOutput
 from outluna.report.generator import ReportGenerator, ReportStorage
 from outluna.strategy.fixed import FixedStrategy
 from outluna.utils.logger import setup_logging
@@ -74,6 +74,9 @@ from outluna.utils.table_image import (
 from outluna.utils.trade_calendar import TradeCalendar
 
 logger = setup_logging()
+
+#: 追踪股池展示的历史交易日数量（与 engine.track_watchlist 默认值保持一致）
+WATCHLIST_TRACK_DAYS = 5
 
 
 def _get_kimi_oauth_client() -> KimiOAuthClient:
@@ -169,6 +172,7 @@ class OutLunaPlugin(star.Star):
             on_track=self._push_track_watchlist,
             on_scan=self._push_auto_scan,
             on_cleanup=self._cleanup_expired_auto,
+            state_path=data_dir / "auto_scheduler_state.json",
         )
 
     async def initialize(self) -> None:
@@ -304,32 +308,78 @@ class OutLunaPlugin(star.Star):
         except Exception as exc:
             logger.error(f"主动消息发送失败[{umo}]：{exc}")
 
-    async def _push_track_watchlist(self, umo: str) -> None:
-        """自动化任务：执行追踪股池并将结果推送到指定群聊。"""
-        try:
-            result = await self.engine.track_watchlist()
-        except Exception as exc:
-            await self._send_message_to(umo, _message(f"自动化追踪股池失败：{exc}"))
-            return
+    def _make_task_engine(self, umo: str) -> OutLunaEngine:
+        """为定时任务构造独立的引擎实例。
+
+        与聊天命令使用的 ``self.engine`` 隔离，避免定时任务与交互命令
+        互相覆盖共享的 ``llm_provider`` / ``on_kimi_auth_error`` 状态
+        （跨会话串用 provider、授权链接发错群聊）。
+        股池存储与报告生成器共享同一持久化后端，数据天然一致。
+        """
+        engine = OutLunaEngine(
+            llm_provider=AstrBotLLMProvider(self.context, unified_msg_origin=umo)
+        )
+        engine.report_generator = self.engine.report_generator
+        engine.watchlist_storage = self.engine.watchlist_storage
+        # 定时任务场景无法交互式授权，Kimi 凭证失效时直接失败并推送提示
+        engine.on_kimi_auth_error = None
+        return engine
+
+    async def _render_watchlist_chain(self, result: ReportOutput, allow_image: bool) -> MessageChain:
+        """将追踪股池结果渲染为消息链（图片优先，失败回退文本）。
+
+        命令入口与自动化推送共用的渲染管线；``allow_image`` 为 False 时
+        （命令带 --txt 标志）强制文本输出。
+        """
         if (
-            self.image_tables_enabled
+            allow_image
+            and self.image_tables_enabled
             and isinstance(result.data, pd.DataFrame)
             and not result.data.empty
         ):
             template = get_template_string()
-            days = 5  # track_watchlist 默认展示最近 5 个交易日
-            data = build_watchlist_data(result.data, days)
+            data = build_watchlist_data(result.data, WATCHLIST_TRACK_DAYS)
             image_path = await self._build_table_image(template, data)
             if image_path:
-                await self._send_message_to(umo, MessageChain().file_image(image_path))
-                return
-        await self._send_message_to(umo, _message(self.formatter.truncate(result.text)))
+                return MessageChain().file_image(image_path)
+            return _message("图片生成失败，已发送文本。\n" + self.formatter.truncate(result.text))
+        return _message(self.formatter.truncate(result.text))
+
+    async def _render_scan_chain(self, result: ReportOutput, allow_image: bool) -> MessageChain:
+        """将选股报告结果渲染为消息链（图片优先，失败回退文本）。
+
+        命令入口与自动化推送共用的渲染管线；``allow_image`` 为 False 时
+        （命令带 --txt 标志）强制文本输出。
+        """
+        if (
+            allow_image
+            and self.image_tables_enabled
+            and isinstance(result.data, ScanReport)
+            and result.data.qualified
+        ):
+            template = get_template_string()
+            data = build_stock_selection_data(result.data)
+            image_path = await self._build_table_image(template, data)
+            if image_path:
+                return MessageChain().file_image(image_path)
+            return _message("图片生成失败，已发送文本。\n" + self.formatter.truncate(result.text))
+        return _message(self.formatter.truncate(result.text))
+
+    async def _push_track_watchlist(self, umo: str) -> None:
+        """自动化任务：执行追踪股池并将结果推送到指定群聊。"""
+        try:
+            result = await self._make_task_engine(umo).track_watchlist()
+        except Exception as exc:
+            await self._send_message_to(umo, _message(f"自动化追踪股池失败：{exc}"))
+            return
+        chain = await self._render_watchlist_chain(result, allow_image=True)
+        await self._send_message_to(umo, chain)
 
     async def _push_auto_scan(self, umo: str) -> None:
         """自动化任务：执行固定策略选股，达标股票自动入库并推送结果。
 
         入库规则：LLM 评分大于等于群配置阈值的股票加入股池（来源标记 auto）；
-        已在池中的 auto 股票刷新加入日期（重新计算 5 个交易日保留期）；
+        已在池中的 auto 股票刷新加入日期（重新计算保留期）；
         手动添加的股票保持原有元数据不变。
         """
         config = self.auto_storage.get_group(umo)
@@ -339,32 +389,16 @@ class OutLunaPlugin(star.Star):
                 _message("自动化选股未配置策略，已跳过。\n请使用 /自动化 设置 策略 <策略名> 进行配置。"),
             )
             return
-        self.engine.llm_provider = AstrBotLLMProvider(self.context, unified_msg_origin=umo)
-        # 定时任务场景无法交互式授权，Kimi 凭证失效时直接失败并推送提示
-        self.engine.on_kimi_auth_error = None
+        engine = self._make_task_engine(umo)
         try:
-            result = await self.engine.select_stocks_by_preset(config.strategy)
+            result = await engine.select_stocks_by_preset(config.strategy)
         except Exception as exc:
             await self._send_message_to(umo, _message(f"自动化选股失败（策略：{config.strategy}）：{exc}"))
             return
 
-        # 发送选股结果（图片优先，与 /固定策略 命令一致）
-        if (
-            self.image_tables_enabled
-            and isinstance(result.data, ScanReport)
-            and result.data.qualified
-        ):
-            template = get_template_string()
-            data = build_stock_selection_data(result.data)
-            image_path = await self._build_table_image(template, data)
-            if image_path:
-                await self._send_message_to(umo, MessageChain().file_image(image_path))
-            else:
-                await self._send_message_to(
-                    umo, _message("图片生成失败，已发送文本。\n" + self.formatter.truncate(result.text))
-                )
-        else:
-            await self._send_message_to(umo, _message(self.formatter.truncate(result.text)))
+        # 发送选股结果（图片优先，与 /固定策略 命令共用渲染管线）
+        chain = await self._render_scan_chain(result, allow_image=True)
+        await self._send_message_to(umo, chain)
 
         # 达标股票入库并推送入库摘要
         summary = self._collect_qualified_to_watchlist(result.data, config, umo)
@@ -376,31 +410,26 @@ class OutLunaPlugin(star.Star):
         config: GroupAutoConfig,
         umo: str,
     ) -> str:
-        """将评分达标的选股结果写入自选股池，返回入库摘要文本。"""
-        today = datetime.now().date().isoformat()
-        added: list[str] = []
-        refreshed: list[str] = []
-        kept_manual: list[str] = []
+        """将评分达标的选股结果批量写入自选股池，返回入库摘要文本。"""
+        labels: dict[str, str] = {}
+        symbols: list[str] = []
         if isinstance(report, ScanReport):
             for item in report.qualified:
                 score = item.match_score if item.match_score is not None else 0.0
                 if score < config.score_threshold:
                     continue
-                label = f"{item.name or item.symbol}({item.symbol}) {score:.0f}分"
-                existing = self.engine.watchlist_storage.get_item(item.symbol)
-                if existing is None:
-                    self.engine.watchlist_storage.add(item.symbol, source=SOURCE_AUTO, added_date=today)
-                    added.append(label)
-                elif existing.source == SOURCE_AUTO:
-                    self.engine.watchlist_storage.refresh_added_date(item.symbol, today)
-                    refreshed.append(label)
-                else:
-                    kept_manual.append(label)
+                symbols.append(item.symbol)
+                labels[item.symbol] = f"{item.name or item.symbol}({item.symbol}) {score:.0f}分"
+        today = datetime.now().date().isoformat()
+        outcome = self.engine.watchlist_storage.upsert_auto_items(symbols, added_date=today)
+        added = [labels.get(s, s) for s in outcome["added"]]
+        refreshed = [labels.get(s, s) for s in outcome["refreshed"]]
+        kept_manual = [labels.get(s, s) for s in outcome["kept_manual"]]
         lines = [
             f"自动选股入库结果（策略：{config.strategy}，阈值：{config.score_threshold:g}分）："
         ]
         if added:
-            lines.append(f"新加入股池（保留5个交易日）：{'、'.join(added)}")
+            lines.append(f"新加入股池（保留{AUTO_KEEP_TRADE_DAYS}个交易日）：{'、'.join(added)}")
         if refreshed:
             lines.append(f"重复推荐，已刷新保留期：{'、'.join(refreshed)}")
         if kept_manual:
@@ -413,10 +442,15 @@ class OutLunaPlugin(star.Star):
     async def _cleanup_expired_auto(self) -> None:
         """自动化任务：移除保留期满的自动入库股票，并通知已开启的群聊。"""
         trade_dates = await asyncio.to_thread(self.trade_calendar.get_trade_dates)
-        removed = self.engine.watchlist_storage.remove_expired_auto(trade_dates, keep_days=5)
+        removed = self.engine.watchlist_storage.remove_expired_auto(
+            trade_dates, keep_days=AUTO_KEEP_TRADE_DAYS
+        )
         if not removed:
             return
-        text = f"以下自动入库股票已保留满 5 个交易日，自动移出股池：{', '.join(removed)}"
+        text = (
+            f"以下自动入库股票已保留满 {AUTO_KEEP_TRADE_DAYS} 个交易日，"
+            f"自动移出股池：{', '.join(removed)}"
+        )
         for umo, config in self.auto_storage.list_groups().items():
             if config.enabled:
                 await self._send_message_to(umo, _message(text))
@@ -428,14 +462,15 @@ class OutLunaPlugin(star.Star):
         lines = [
             "本群自动化工作流配置：",
             f"- 状态：{'已开启' if config.enabled else '已关闭'}",
-            f"- 追踪股池推送时间：{'、'.join(config.track_times)}",
+            f"- 追踪股池推送时间：{'、'.join(config.track_times) if config.track_times else '无（已关闭盘中推送）'}",
             f"- 自动选股时间：{config.scan_time}",
             f"- 选股策略：{config.strategy or '未配置'}",
             f"- 入库评分阈值：{config.score_threshold:g} 分",
+            f"- 自动入库股票保留期：{AUTO_KEEP_TRADE_DAYS} 个交易日",
             "",
             "配置命令：",
             "/自动化 开 | /自动化 关",
-            "/自动化 设置 推送时间 09:30 13:30",
+            "/自动化 设置 推送时间 09:30 13:30（设为 无 可关闭盘中推送）",
             "/自动化 设置 选股时间 16:00",
             f"/自动化 设置 策略 <策略名>（可用：{', '.join(presets) if presets else '无'}）",
             "/自动化 设置 阈值 70",
@@ -452,6 +487,11 @@ class OutLunaPlugin(star.Star):
         config = self.auto_storage.get_group(umo)
 
         if key == "推送时间":
+            if values == ["无"]:
+                config.track_times = []
+                self.auto_storage.save_group(umo, config)
+                await event.send(_message("追踪股池推送时间已清空，盘中推送已关闭（封盘后选股不受影响）。"))
+                return
             if not values or any(not is_valid_time(v) for v in values):
                 await event.send(_message("时间格式错误，应为 HH:MM，例如：/自动化 设置 推送时间 09:30 13:30"))
                 return
@@ -500,6 +540,18 @@ class OutLunaPlugin(star.Star):
     async def auto_workflow(self, event: AstrMessageEvent, args: str = ""):
         """配置自动化工作流。用法：/自动化 [开|关|设置 ...]"""
         umo = event.unified_msg_origin
+        try:
+            await self._dispatch_auto_command(event, umo, args)
+        except Exception as exc:
+            logger.error(f"/自动化 命令执行失败：{exc}")
+            await event.send(
+                _message(f"自动化配置保存失败：{exc}\n配置文件可能已损坏，请检查数据目录中的备份文件。")
+            )
+
+    async def _dispatch_auto_command(
+        self, event: AstrMessageEvent, umo: str, args: str
+    ) -> None:
+        """解析并分发 /自动化 子命令。"""
         parts = args.split()
         if not parts:
             await event.send(_message(self._format_auto_config(umo)))
@@ -531,25 +583,8 @@ class OutLunaPlugin(star.Star):
             self.engine.llm_provider = llm_provider
             self.engine.on_kimi_auth_error = lambda msg: self._refresh_kimi_credentials(event, msg)
             result = await self.engine.select_stocks(requirements)
-            if (
-                not txt_flag
-                and self.image_tables_enabled
-                and isinstance(result.data, ScanReport)
-                and result.data.qualified
-            ):
-                template = get_template_string()
-                data = build_stock_selection_data(result.data)
-                image_path = await self._build_table_image(template, data)
-                if image_path:
-                    await event.send(MessageChain().file_image(image_path))
-                else:
-                    await event.send(
-                        _message(
-                            "图片生成失败，已发送文本。\n" + self.formatter.truncate(result.text)
-                        )
-                    )
-            else:
-                await event.send(_message(self.formatter.truncate(result.text)))
+            chain = await self._render_scan_chain(result, allow_image=not txt_flag)
+            await event.send(chain)
         except Exception as exc:
             await event.send(_message(f"选股失败：{exc}"))
 
@@ -564,25 +599,8 @@ class OutLunaPlugin(star.Star):
             self.engine.llm_provider = llm_provider
             self.engine.on_kimi_auth_error = lambda msg: self._refresh_kimi_credentials(event, msg)
             result = await self.engine.select_stocks_by_preset(preset_name)
-            if (
-                not txt_flag
-                and self.image_tables_enabled
-                and isinstance(result.data, ScanReport)
-                and result.data.qualified
-            ):
-                template = get_template_string()
-                data = build_stock_selection_data(result.data)
-                image_path = await self._build_table_image(template, data)
-                if image_path:
-                    await event.send(MessageChain().file_image(image_path))
-                else:
-                    await event.send(
-                        _message(
-                            "图片生成失败，已发送文本。\n" + self.formatter.truncate(result.text)
-                        )
-                    )
-            else:
-                await event.send(_message(self.formatter.truncate(result.text)))
+            chain = await self._render_scan_chain(result, allow_image=not txt_flag)
+            await event.send(chain)
         except Exception as exc:
             await event.send(_message(f"固定策略选股失败：{exc}"))
 
@@ -643,26 +661,8 @@ class OutLunaPlugin(star.Star):
         await event.send(_message("正在拉取自选股池行情，请稍候..."))
         try:
             result = await self.engine.track_watchlist()
-            if (
-                not txt_flag
-                and self.image_tables_enabled
-                and isinstance(result.data, pd.DataFrame)
-                and not result.data.empty
-            ):
-                template = get_template_string()
-                days = 5  # track_watchlist 默认展示最近 5 个交易日
-                data = build_watchlist_data(result.data, days)
-                image_path = await self._build_table_image(template, data)
-                if image_path:
-                    await event.send(MessageChain().file_image(image_path))
-                else:
-                    await event.send(
-                        _message(
-                            "图片生成失败，已发送文本。\n" + self.formatter.truncate(result.text)
-                        )
-                    )
-            else:
-                await event.send(_message(self.formatter.truncate(result.text)))
+            chain = await self._render_watchlist_chain(result, allow_image=not txt_flag)
+            await event.send(chain)
         except Exception as exc:
             await event.send(_message(f"追踪股池失败：{exc}"))
 

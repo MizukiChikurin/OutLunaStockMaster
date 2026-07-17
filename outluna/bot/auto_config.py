@@ -4,15 +4,18 @@
 配置文件为 ``<data_dir>/auto_workflow.json``。支持两种配置方式：
 1. 聊天命令（``/自动化 ...``）实时修改并保存；
 2. 手动编辑 JSON 文件，调度器每个检查周期重新读取，自动生效。
+
+写入采用原子替换；保存前的读取为 fail-closed（文件损坏时备份并抛异常），
+避免以空快照覆盖全部群配置。
 """
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from outluna.utils.json_io import read_json_strict, write_json_atomic
 from outluna.utils.logger import setup_logging
 
 logger = setup_logging()
@@ -74,9 +77,8 @@ class GroupAutoConfig:
         config.enabled = bool(data.get("enabled", False))
         track_times = data.get("track_times")
         if isinstance(track_times, list):
-            valid_times = [str(t) for t in track_times if is_valid_time(str(t))]
-            if valid_times:
-                config.track_times = valid_times
+            # 显式配置（包括显式空列表，表示关闭盘中推送）优先于默认值
+            config.track_times = [str(t) for t in track_times if is_valid_time(str(t))]
         scan_time = str(data.get("scan_time", "") or "")
         if is_valid_time(scan_time):
             config.scan_time = scan_time
@@ -102,25 +104,27 @@ class AutoWorkflowStorage:
     def _ensure_file(self) -> None:
         """确保 JSON 文件存在，不存在则写入默认空结构。"""
         if not self.file_path.exists():
-            self._write({"groups": {}})
+            write_json_atomic(self.file_path, {"groups": {}})
 
-    def _read(self) -> dict[str, Any]:
-        """读取整个配置文件，失败时返回空结构。"""
+    def _read(self, strict: bool = False) -> dict[str, Any]:
+        """读取整个配置文件。
+
+        Args:
+            strict: 为 True 时文件损坏会备份并抛出异常（fail-closed），
+                用于保存前置读取，防止以空快照覆盖全部群配置；
+                为 False 时损坏仅告警并返回空结构，用于纯读场景。
+        """
         try:
-            with open(self.file_path, encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                groups = data.get("groups")
-                if isinstance(groups, dict):
-                    return data
-        except (json.JSONDecodeError, OSError) as exc:
+            data = read_json_strict(self.file_path)
+        except Exception as exc:
+            if strict:
+                raise
             logger.warning(f"自动化配置读取失败，将使用空配置：{exc}")
+            return {"groups": {}}
+        groups = data.get("groups")
+        if isinstance(groups, dict):
+            return data
         return {"groups": {}}
-
-    def _write(self, data: dict[str, Any]) -> None:
-        """将整个配置写入文件。"""
-        with open(self.file_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
 
     def get_group(self, umo: str) -> GroupAutoConfig:
         """获取指定群聊的配置，不存在时返回默认配置（不落盘）。"""
@@ -131,10 +135,10 @@ class AutoWorkflowStorage:
         return GroupAutoConfig.from_dict(raw)
 
     def save_group(self, umo: str, config: GroupAutoConfig) -> None:
-        """保存指定群聊的配置。"""
-        data = self._read()
+        """保存指定群聊的配置（读取失败时拒绝写入，防止覆盖其他群）。"""
+        data = self._read(strict=True)
         data["groups"][umo] = config.to_dict()
-        self._write(data)
+        write_json_atomic(self.file_path, data)
         logger.info(f"自动化配置已保存：{umo} -> enabled={config.enabled}")
 
     def list_groups(self) -> dict[str, GroupAutoConfig]:

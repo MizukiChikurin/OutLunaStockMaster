@@ -14,7 +14,7 @@ from outluna.analysis.orchestrator import AnalysisOrchestrator
 from outluna.config import settings
 from outluna.data.gateway import DataGateway
 from outluna.data.providers.kimi_provider import KimiAuthError
-from outluna.data.watchlist import WatchlistStorage
+from outluna.data.watchlist import SOURCE_AUTO, SOURCE_MANUAL, WatchlistStorage
 from outluna.llm.base import LLMProvider
 from outluna.report.generator import ReportGenerator
 from outluna.strategy import registry
@@ -223,6 +223,9 @@ class OutLunaEngine:
     async def add_watch(self, symbol: str) -> str:
         """将股票加入自选股池。
 
+        若股票已存在且来源为自动入库（auto），手动添加会将其升级为
+        手动持有（manual），不再受自动移除机制影响。
+
         Args:
             symbol: 股票代码，支持任意常用格式，会自动标准化。
 
@@ -233,6 +236,13 @@ class OutLunaEngine:
         added = self.watchlist_storage.add(symbol)
         normalized = self.watchlist_storage.list()
         if not added:
+            item = self.watchlist_storage.get_item(symbol)
+            if item is not None and item.source == SOURCE_AUTO:
+                self.watchlist_storage.set_source(symbol, SOURCE_MANUAL)
+                return (
+                    f"{symbol} 已在自选股池中（自动入库），已转为手动持有，不再自动移除。\n"
+                    f"当前股池：{', '.join(normalized)}"
+                )
             return f"{symbol} 已在自选股池中。\n当前股池：{', '.join(normalized) if normalized else '空'}"
         return f"已将 {symbol} 加入自选股池。\n当前股池：{', '.join(normalized)}"
 
@@ -334,10 +344,15 @@ class OutLunaEngine:
         start_date = (datetime.now() - timedelta(days=max(days * 2, 30))).strftime("%Y-%m-%d")
 
         metric = metrics.start_operation("track_watchlist", symbols=len(symbols))
-        ohlcv_data = self.gateway.get_ohlcv_multi(
-            symbols, start_date=start_date, end_date=end_date, bars=days
+        # 网关数据访问为同步阻塞网络调用，放入线程执行避免阻塞事件循环
+        ohlcv_data = await asyncio.to_thread(
+            self.gateway.get_ohlcv_multi,
+            symbols,
+            start_date=start_date,
+            end_date=end_date,
+            bars=days,
         )
-        realtime_data = self._get_realtime_data(symbols)
+        realtime_data = await asyncio.to_thread(self._get_realtime_data, symbols)
 
         date_columns = [f"日期{i}" for i in range(1, days + 1)]
         wide_rows: list[dict[str, str]] = []
@@ -346,8 +361,12 @@ class OutLunaEngine:
             df = ohlcv_data.get(symbol)
             if df is None or df.empty:
                 try:
-                    df = self.gateway.get_ohlcv(
-                        symbol, start_date=start_date, end_date=end_date, bars=days
+                    df = await asyncio.to_thread(
+                        self.gateway.get_ohlcv,
+                        symbol,
+                        start_date=start_date,
+                        end_date=end_date,
+                        bars=days,
                     )
                 except Exception as exc:
                     logger.warning(f"获取 {symbol} K 线失败：{exc}")
@@ -357,7 +376,7 @@ class OutLunaEngine:
                 failed_symbols.append(symbol)
                 continue
 
-            name = self._get_stock_name(symbol)
+            name = await asyncio.to_thread(self._get_stock_name, symbol)
             stock_label = f"{name}{symbol}" if name != symbol else symbol
             realtime = realtime_data.get(symbol, {})
             row: dict[str, str] = {"股票": stock_label}

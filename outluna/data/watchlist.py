@@ -7,17 +7,21 @@
 - 来源（source）：``manual`` 表示用户手动添加，``auto`` 表示自动化选股入库；
 - 加入日期（added_date）：自动入库的股票按交易日计算保留期，超期自动移除；
   手动添加的股票不受自动移除机制影响。
+
+写入采用原子替换（临时文件 + os.replace）；读取损坏时写路径 fail-closed
+（备份损坏文件并抛异常），避免"损坏 -> 回退空结构 -> 覆盖"的静默数据丢失。
 """
 
 from __future__ import annotations
 
-import json
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from outluna.config import settings
+from outluna.utils.json_io import read_json_strict, write_json_atomic
 from outluna.utils.logger import setup_logging
 from outluna.utils.symbol import SymbolNormalizer
 
@@ -27,6 +31,8 @@ logger = setup_logging()
 SOURCE_MANUAL = "manual"
 #: 股票来源：自动化工作流入库
 SOURCE_AUTO = "auto"
+#: 自动入库股票的默认保留期（交易日数）：加入日记为第 1 天，第 N+1 个交易日移除
+AUTO_KEEP_TRADE_DAYS = 5
 
 
 @dataclass
@@ -133,33 +139,36 @@ class WatchlistStorage:
         if not self.file_path.exists():
             self._save(Watchlist())
 
-    def _load(self) -> Watchlist:
-        """从文件加载自选股池。"""
+    def _load(self, strict: bool = False) -> Watchlist:
+        """从文件加载自选股池。
+
+        Args:
+            strict: 为 True 时文件损坏会备份并抛出异常（fail-closed），
+                用于写入前置读取，防止以空快照覆盖原文件；
+                为 False 时损坏仅告警并返回空股池，用于纯读场景。
+        """
+        if strict:
+            return Watchlist.from_dict(read_json_strict(self.file_path))
         try:
-            with open(self.file_path, encoding="utf-8") as f:
-                data = json.load(f)
-            return Watchlist.from_dict(data)
-        except (json.JSONDecodeError, OSError) as exc:
+            return Watchlist.from_dict(read_json_strict(self.file_path))
+        except Exception as exc:
             logger.warning(f"自选股池文件读取失败，将使用空股池：{exc}")
             return Watchlist()
 
     def _save(self, watchlist: Watchlist) -> None:
-        """将自选股池保存到文件。"""
-        normalized_symbols = SymbolNormalizer.normalize_list(watchlist.symbols)
-        normalized_set = set(normalized_symbols)
+        """将自选股池原子写入文件（标准化 + 去重 + 刷新更新时间）。"""
         seen: set[str] = set()
         deduped_items: list[WatchlistItem] = []
         for item in watchlist.items:
             normalized = SymbolNormalizer.normalize(item.symbol)
-            if not normalized or normalized not in normalized_set or normalized in seen:
+            if not normalized or normalized in seen:
                 continue
             seen.add(normalized)
             item.symbol = normalized
             deduped_items.append(item)
         watchlist.items = deduped_items
         watchlist.updated_at = datetime.now()
-        with open(self.file_path, "w", encoding="utf-8") as f:
-            json.dump(watchlist.to_dict(), f, ensure_ascii=False, indent=2)
+        write_json_atomic(self.file_path, watchlist.to_dict())
 
     def add(
         self,
@@ -180,7 +189,7 @@ class WatchlistStorage:
         normalized = SymbolNormalizer.normalize(symbol)
         if not normalized:
             raise ValueError(f"股票代码格式错误：{symbol}")
-        watchlist = self._load()
+        watchlist = self._load(strict=True)
         if normalized in watchlist.symbols:
             return False
         watchlist.items.append(
@@ -193,6 +202,26 @@ class WatchlistStorage:
         self._save(watchlist)
         logger.info(f"自选股池添加：{normalized}（来源：{source}）")
         return True
+
+    def set_source(self, symbol: str, source: str) -> bool:
+        """修改已存在股票的来源标记（如 auto 升级为 manual）。
+
+        Returns:
+            股票存在并修改成功返回 True，不存在返回 False。
+        """
+        normalized = SymbolNormalizer.normalize(symbol)
+        if not normalized:
+            raise ValueError(f"股票代码格式错误：{symbol}")
+        watchlist = self._load(strict=True)
+        for item in watchlist.items:
+            if item.symbol == normalized:
+                if item.source == source:
+                    return True
+                item.source = source
+                self._save(watchlist)
+                logger.info(f"自选股池来源变更：{normalized} -> {source}")
+                return True
+        return False
 
     def refresh_added_date(self, symbol: str, added_date: str | None = None) -> bool:
         """刷新已存在股票的加入日期（用于自动入库股票被重复推荐的场景）。
@@ -207,7 +236,7 @@ class WatchlistStorage:
         normalized = SymbolNormalizer.normalize(symbol)
         if not normalized:
             raise ValueError(f"股票代码格式错误：{symbol}")
-        watchlist = self._load()
+        watchlist = self._load(strict=True)
         for item in watchlist.items:
             if item.symbol == normalized:
                 item.added_date = added_date or datetime.now().date().isoformat()
@@ -215,6 +244,53 @@ class WatchlistStorage:
                 logger.info(f"自选股池刷新加入日期：{normalized} -> {item.added_date}")
                 return True
         return False
+
+    def upsert_auto_items(
+        self,
+        symbols: list[str],
+        added_date: str | None = None,
+    ) -> dict[str, list[str]]:
+        """批量将自动选股结果写入股池（一次读取、一次写入）。
+
+        规则：新股票以 auto 来源加入；已在池中的 auto 股票刷新加入日期；
+        手动添加的股票保持原样。
+
+        Args:
+            symbols: 待入库股票代码列表（会被标准化、去重）。
+            added_date: 加入日期（``YYYY-MM-DD``），默认取今天。
+
+        Returns:
+            分类结果字典：``{"added": [...], "refreshed": [...], "kept_manual": [...]}``，
+            各值为标准化后的股票代码列表。
+        """
+        added_date = added_date or datetime.now().date().isoformat()
+        watchlist = self._load(strict=True)
+        existing = {item.symbol: item for item in watchlist.items}
+        result: dict[str, list[str]] = {"added": [], "refreshed": [], "kept_manual": []}
+        changed = False
+        for symbol in SymbolNormalizer.normalize_list(symbols):
+            item = existing.get(symbol)
+            if item is None:
+                watchlist.items.append(
+                    WatchlistItem(symbol=symbol, added_date=added_date, source=SOURCE_AUTO)
+                )
+                existing[symbol] = watchlist.items[-1]
+                result["added"].append(symbol)
+                changed = True
+            elif item.source == SOURCE_AUTO:
+                if item.added_date != added_date:
+                    item.added_date = added_date
+                    changed = True
+                result["refreshed"].append(symbol)
+            else:
+                result["kept_manual"].append(symbol)
+        if changed:
+            self._save(watchlist)
+        logger.info(
+            f"自动入库批量写入：新增 {len(result['added'])}，"
+            f"刷新 {len(result['refreshed'])}，手动保留 {len(result['kept_manual'])}"
+        )
+        return result
 
     def get_item(self, symbol: str) -> WatchlistItem | None:
         """获取单只股票的元数据，不存在时返回 None。"""
@@ -226,15 +302,11 @@ class WatchlistStorage:
                 return item
         return None
 
-    def list_items(self) -> list[WatchlistItem]:
-        """返回当前自选股池所有股票的元数据列表副本。"""
-        return list(self._load().items)
-
     def remove_expired_auto(
         self,
         trade_dates: list[str],
         today: str | None = None,
-        keep_days: int = 5,
+        keep_days: int = AUTO_KEEP_TRADE_DAYS,
     ) -> list[str]:
         """移除保留期满的自动入库股票。
 
@@ -242,17 +314,16 @@ class WatchlistStorage:
         第 ``keep_days + 1`` 个交易日移除。手动添加的股票不受影响。
 
         Args:
-            trade_dates: 升序排列的交易日列表（``YYYY-MM-DD`` 字符串），
-                需覆盖加入日期至今天的区间。
+            trade_dates: 严格升序排列的交易日列表（``YYYY-MM-DD`` 字符串，
+                字典序与时间序一致），需覆盖加入日期至今天的区间。
             today: 今天日期（``YYYY-MM-DD``），默认取系统今天。
-            keep_days: 保留的交易日数量，默认 5。
+            keep_days: 保留的交易日数量，默认 :data:`AUTO_KEEP_TRADE_DAYS`。
 
         Returns:
             被移除的股票代码列表。
         """
         today = today or datetime.now().date().isoformat()
-        trade_date_set = set(trade_dates)
-        watchlist = self._load()
+        watchlist = self._load(strict=True)
         removed: list[str] = []
         kept_items: list[WatchlistItem] = []
         for item in watchlist.items:
@@ -260,7 +331,9 @@ class WatchlistStorage:
                 kept_items.append(item)
                 continue
             # 统计 [加入日期, 今天] 区间内的交易日数量（加入日记为第 1 天）
-            held_days = sum(1 for d in trade_date_set if item.added_date <= d <= today)
+            lo = bisect_left(trade_dates, item.added_date)
+            hi = bisect_right(trade_dates, today)
+            held_days = hi - lo
             if held_days > keep_days:
                 removed.append(item.symbol)
                 logger.info(
@@ -286,7 +359,7 @@ class WatchlistStorage:
         normalized = SymbolNormalizer.normalize(symbol)
         if not normalized:
             raise ValueError(f"股票代码格式错误：{symbol}")
-        watchlist = self._load()
+        watchlist = self._load(strict=True)
         if normalized not in watchlist.symbols:
             return False
         watchlist.items = [item for item in watchlist.items if item.symbol != normalized]
