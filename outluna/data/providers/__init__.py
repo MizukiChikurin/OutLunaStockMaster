@@ -84,6 +84,10 @@ class DataProvider:
         """获取实时技术指标。"""
         return pd.DataFrame()
 
+    def get_close_summary(self, symbols: list[str]) -> pd.DataFrame:
+        """获取收盘/开盘汇总数据，用于获取今日开盘价等日线汇总信息。"""
+        return pd.DataFrame()
+
     def get_a_share_spot(self) -> pd.DataFrame:
         """获取 A 股全市场实时行情快照。"""
         return pd.DataFrame()

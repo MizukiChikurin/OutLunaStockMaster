@@ -65,17 +65,11 @@ class UserStrategyConfigOutput(BaseModel):
         default="",
         description="可调用 akshare 接口的 Python 初筛代码，必须输出 result 变量为股票代码列表或 DataFrame",
     )
-    min_recommend_score: float = Field(
-        default=0.0, description="推荐最低分，0 表示不强制分数门槛，所有通过初筛的股票均可推荐"
-    )
-    min_watch_score: float = Field(
-        default=60.0, description="观察股最低分",
-    )
     max_analyze: int = Field(
         default=100, ge=0, le=100, description="最大分析股票数，0 表示分析股票池粗筛后的全部股票；默认 100，设置正数可限制数据源调用成本"
     )
     task_label: str = Field(
-        default="", description="任务标签，用于生成文件夹名，例如：散户止损、低位启动",
+        default="", description="任务标签，用于生成文件夹名，例如：散户止损、低位启动、量价齐升。"
     )
     required_data_sources: list[str] = Field(
         default_factory=lambda: ["spot", "tech"],
@@ -190,8 +184,8 @@ screening_code 可使用的 akshare 接口（推荐）：
             "1. 忠实还原用户要求，不添加用户未提及的规则；\n"
             "2. 将条件分类为：股票池粗筛（pool_filters）、一票否决（veto_rules）、"
             "硬性入选（entry_rules）。不要生成评分维度（score_dimensions），"
-            "即使原要求中包含“评分”“打分”“权重”等字样，也统一将其细化为可执行的硬性入选规则，"
-            "由执行器直接判断通过/不通过，不再做量化评分；\n"
+            "评分不再由执行器按规则计算，而是将每只股票的数据连同用户要求一起交给 LLM，"
+            "由 LLM 给出 0-100 的综合评分和推荐理由；\n"
             "   注意：只有用户明确使用“一票否决”“剔除”“排除”等字样要求时才生成 veto_rules，"
             "否则必须将 veto_rules 留空，避免默认剔除股票；\n"
             "3. 只使用下方列出的可用字段和操作符；\n"
@@ -201,9 +195,9 @@ screening_code 可使用的 akshare 接口（推荐）：
             "6. 止损线/支撑位/密集成交区/散户止损等模糊概念，"
             "应使用 dist_to_20d_low_pct 或 dist_to_60d_low_pct 等字段量化："
             "例如 'dist_to_20d_low_pct between 0 and 3' 表示价格接近20日低点。\n"
-            "7. 请根据用户要求总结一个简短 task_label（2-6个汉字），"
+            "8. 请根据用户要求总结一个简短 task_label（2-6个汉字），"
             "用于生成报告文件夹名，例如：散户止损、低位启动、量价齐升。\n"
-            "8. 必须生成一段 screening_code（Python 代码），用于执行初筛并快速缩小股票池。\n"
+            "9. 必须生成一段 screening_code（Python 代码），用于执行初筛并快速缩小股票池。\n"
             "   - screening_code 可直接调用 akshare 接口（见下方接口列表），\n"
             "     而不再限于实时快照字段；\n"
             "   - 它是粗筛，不要把所有条件都塞进来；主要用于快速缩小股票池，\n"

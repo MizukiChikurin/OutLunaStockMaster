@@ -265,9 +265,67 @@ class KimiDataSourceBase(DataProvider, ABC):
             }
         )
         if "date" in df.columns:
-            df["date"] = pd.to_datetime(df["date"])
+            df["date"] = self._parse_dates(df["date"])
+            # 按日期升序排列，确保 tail(days) 取到最近数据
+            df = df.sort_values("date").reset_index(drop=True)
         cols = [c for c in ["date", "open", "high", "low", "close", "volume"] if c in df.columns]
         return df[cols].copy()
+
+    def _parse_dates(self, series: pd.Series) -> pd.Series:
+        """将日期列统一解析为 datetime，兼容多种时间戳与字符串格式。
+
+        数据源可能返回 ISO 字符串、秒级/毫秒级 Unix 时间戳、YYYYMMDD 整数等。
+        本方法依次尝试多种解析方式，并选择第一个结果落在合理年份范围（1971-2099）
+        的解析结果；若均不合理，则返回原序列。
+        """
+        if pd.api.types.is_datetime64_any_dtype(series):
+            return series
+
+        def _is_reasonable(parsed: pd.Series) -> bool:
+            """判断解析后的日期是否落在合理年份范围。"""
+            if parsed.empty:
+                return True
+            try:
+                year = int(parsed.max().year)
+                return 1971 <= year <= 2099
+            except Exception:
+                return False
+
+        candidates: list[pd.Series] = []
+
+        # 1. 默认解析（ISO 字符串、普通日期字符串等）
+        try:
+            candidates.append(pd.to_datetime(series))
+        except Exception:
+            pass
+
+        # 2. 秒级 Unix 时间戳
+        try:
+            candidates.append(pd.to_datetime(series, unit="s"))
+        except Exception:
+            pass
+
+        # 3. 毫秒级 Unix 时间戳
+        try:
+            candidates.append(pd.to_datetime(series, unit="ms"))
+        except Exception:
+            pass
+
+        # 4. YYYYMMDD 整数/字符串格式
+        try:
+            candidates.append(pd.to_datetime(series.astype(str), format="%Y%m%d"))
+        except Exception:
+            pass
+
+        # 选择第一个合理的解析结果
+        for parsed in candidates:
+            if _is_reasonable(parsed):
+                return parsed
+
+        # 没有合理结果时返回首个候选，最差情况返回原序列
+        if candidates:
+            return candidates[0]
+        return series
 
     def get_stock_list(self, market: str = "A") -> list[str]:
         """Kimi Datasource 不直接提供全市场列表，通过通用选股接口获取。"""
@@ -290,6 +348,16 @@ class KimiDataSourceBase(DataProvider, ABC):
             raise ValueError("Kimi Datasource 实时技术指标每次最多 3 只股票")
 
         params = {"ticker": ",".join(symbols), "type": "realtime_tech"}
+        text = self._query_stock(params)
+        self._check_error(text)
+        return self._read_csv_result(text)
+
+    def get_close_summary(self, symbols: list[str]) -> pd.DataFrame:
+        """获取日线收盘/开盘汇总数据，用于获取今日开盘价等日线汇总信息。"""
+        if len(symbols) > 3:
+            raise ValueError("Kimi Datasource close_summary 每次最多 3 只股票")
+
+        params = {"ticker": ",".join(symbols), "type": "close_summary"}
         text = self._query_stock(params)
         self._check_error(text)
         return self._read_csv_result(text)

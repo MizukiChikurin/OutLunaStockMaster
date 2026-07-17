@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
+
+import pandas as pd
 
 from outluna.analysis.orchestrator import AnalysisOrchestrator
-from outluna.backtest.engine import run_backtest
 from outluna.config import settings
 from outluna.data.gateway import DataGateway
 from outluna.data.providers.kimi_provider import KimiAuthError
@@ -15,12 +18,22 @@ from outluna.data.watchlist import WatchlistStorage
 from outluna.llm.base import LLMProvider
 from outluna.report.generator import ReportGenerator
 from outluna.strategy import registry
+from outluna.strategy.fixed import FixedStrategy
 from outluna.strategy.scanner import StockScanner
 from outluna.utils.logger import setup_logging
 from outluna.utils.metrics import metrics
+from outluna.utils.symbol import SymbolNormalizer
 from outluna.utils.validation import InputValidator
 
 logger = setup_logging()
+
+
+@dataclass
+class ReportOutput:
+    """引擎命令输出结构：同时包含展示文本与结构化数据。"""
+
+    text: str
+    data: Any | None = None
 
 
 class OutLunaEngine:
@@ -39,53 +52,36 @@ class OutLunaEngine:
         """初始化引擎。"""
         logger.info("OutLuna 引擎初始化完成")
 
-    async def scan(
-        self,
-        strategy_name: str,
-        universe: list[str] | None = None,
-        max_candidates: int | None = None,
-    ) -> str:
-        """执行策略扫描并保存报告，返回报告文本。"""
-        strategy_name = InputValidator.validate_strategy_name(strategy_name)
-        max_candidates = InputValidator.validate_max_candidates(max_candidates)
-        if universe is not None:
-            universe = InputValidator.validate_symbols(universe)
-
-        metric = metrics.start_operation("scan", strategy=strategy_name)
-        try:
-            strategy = registry.build(strategy_name)
-            scanner = StockScanner(self.gateway, strategy)
-            report = await scanner.scan(universe=universe, max_candidates=max_candidates)
-            self.report_generator.save(report)
-            metric.finish(success=True, matched=len(report.matches))
-            logger.info(f"扫描完成：{strategy_name}，命中 {len(report.matches)} 只")
-            return report.format_text()
-        except Exception as exc:
-            metric.finish(success=False, error=str(exc))
-            logger.error(f"扫描失败：{exc}")
-            raise
-
-    async def select_stocks(self, requirements_text: str = "") -> str:
-        """执行用户自定义选股流程并返回报告文本。
+    async def select_stocks(self, requirements_text: str = "") -> ReportOutput:
+        """执行用户自定义选股流程并返回报告文本与结构化数据。
 
         该方法对应“选股要求以聊天形式输入”的场景。
         若未提供选股要求文本，则提示用户输入。
+
+        Returns:
+            ReportOutput: ``text`` 为发送给用户的文本，``data`` 为 ``ScanReport`` 对象，
+            供 AstrBot 入口渲染图片表格使用。
         """
         metric = metrics.start_operation("select_stocks")
         for attempt in range(2):
             try:
                 if not requirements_text or not requirements_text.strip():
-                    return (
-                        "请提供选股要求。\n"
-                        "用法：/选股 <选股要求文本>\n"
-                        "例如：/选股 选择近5日涨幅不超过10%、RSI在40-70之间、站上MA5的股票"
+                    return ReportOutput(
+                        text=(
+                            "请提供选股要求。\n"
+                            "用法：/选股 <选股要求文本>\n"
+                            "例如：/选股 选择近5日涨幅不超过10%、RSI在40-70之间、站上MA5的股票"
+                        )
                     )
 
-                strategy = registry.build("用户自定义选股", params={
-                    "requirements_text": requirements_text,
-                    "llm_provider": self.llm_provider,
-                    "on_auth_error": self.on_kimi_auth_error,
-                })
+                strategy = registry.build(
+                    "用户自定义选股",
+                    params={
+                        "requirements_text": requirements_text,
+                        "llm_provider": self.llm_provider,
+                        "on_auth_error": self.on_kimi_auth_error,
+                    },
+                )
                 # 显式确保 llm_provider 传递到策略实例，避免依赖 _apply_params
                 if self.llm_provider is not None and hasattr(strategy, "llm_provider"):
                     strategy.llm_provider = self.llm_provider
@@ -98,10 +94,9 @@ class OutLunaEngine:
                 report = await scanner.scan()
                 txt_path = self.report_generator.save(report)
                 formatted = report.format_text()
-                return (
-                    f"{formatted}\n\n"
-                    f"---\n"
-                    f"完整选股报告已保存至：{txt_path}"
+                return ReportOutput(
+                    text=(f"{formatted}\n\n---\n完整选股报告已保存至：{txt_path}"),
+                    data=report,
                 )
             except KimiAuthError as exc:
                 if attempt == 0 and self.on_kimi_auth_error is not None:
@@ -113,7 +108,64 @@ class OutLunaEngine:
                 logger.error(f"选股失败：{exc}")
                 raise
         # 理论上不会执行到这里，保留类型安全
-        return "选股失败：重试后仍无法完成选股"
+        return ReportOutput(text="选股失败：重试后仍无法完成选股")
+
+    async def select_stocks_by_preset(self, preset_name: str = "") -> ReportOutput:
+        """执行固定策略选股流程并返回报告文本与结构化数据。
+
+        该方法对应“使用预设策略文件”的场景。若未提供策略名称，则列出可用策略。
+
+        Returns:
+            ReportOutput: ``text`` 为发送给用户的文本，``data`` 为 ``ScanReport`` 对象。
+        """
+        metric = metrics.start_operation("select_stocks_by_preset", preset_name=preset_name)
+        for attempt in range(2):
+            try:
+                if not preset_name or not preset_name.strip():
+                    presets = FixedStrategy.list_presets()
+                    return ReportOutput(
+                        text=(
+                            "请提供固定策略名称。\n"
+                            "用法：/固定策略 <策略名称>\n"
+                            f"可用策略：{', '.join(presets) if presets else '无'}"
+                        )
+                    )
+
+                strategy = registry.build(
+                    "固定策略选股",
+                    params={
+                        "preset_name": preset_name,
+                        "llm_provider": self.llm_provider,
+                        "on_auth_error": self.on_kimi_auth_error,
+                    },
+                )
+                # 显式确保 llm_provider 传递到策略实例，避免依赖 _apply_params
+                if self.llm_provider is not None and hasattr(strategy, "llm_provider"):
+                    strategy.llm_provider = self.llm_provider
+                    logger.debug(f"已将 llm_provider 注入策略：{type(self.llm_provider).__name__}")
+                if self.on_kimi_auth_error is not None and hasattr(strategy, "on_auth_error"):
+                    strategy.on_auth_error = self.on_kimi_auth_error
+                    logger.debug("已将 on_auth_error 回调注入策略")
+
+                scanner = StockScanner(self.gateway, strategy)
+                report = await scanner.scan()
+                txt_path = self.report_generator.save(report)
+                formatted = report.format_text()
+                return ReportOutput(
+                    text=(f"{formatted}\n\n---\n完整选股报告已保存至：{txt_path}"),
+                    data=report,
+                )
+            except KimiAuthError as exc:
+                if attempt == 0 and self.on_kimi_auth_error is not None:
+                    logger.warning(f"Kimi 凭证过期，尝试刷新：{exc}")
+                    await self.on_kimi_auth_error(str(exc))
+                    await asyncio.sleep(8)
+                    continue
+                metric.finish(success=False, error=str(exc))
+                logger.error(f"固定策略选股失败：{exc}")
+                raise
+        # 理论上不会执行到这里，保留类型安全
+        return ReportOutput(text="固定策略选股失败：重试后仍无法完成选股")
 
     async def analyze(self, symbol: str, strategy_name: str = "") -> str:
         """分析指定股票并保存报告，返回报告文本。
@@ -146,48 +198,6 @@ class OutLunaEngine:
             logger.error(f"分析失败：{exc}")
             raise
 
-    async def backtest(
-        self,
-        strategy_name: str,
-        days: int = 90,
-        universe: list[str] | None = None,
-    ) -> str:
-        """执行策略回测并保存报告，返回报告文本。"""
-        strategy_name = InputValidator.validate_strategy_name(strategy_name)
-        days = InputValidator.validate_days(days)
-        if universe is not None:
-            universe = InputValidator.validate_symbols(universe)
-
-        from datetime import datetime, timedelta
-
-        metric = metrics.start_operation("backtest", strategy=strategy_name, days=days)
-        try:
-            end_date = datetime.now()
-            start_date = end_date - timedelta(days=days)
-            report = run_backtest(
-                strategy_name,
-                start_date=start_date,
-                end_date=end_date,
-                universe=universe,
-            )
-            self.report_generator.save(report)
-            metric.finish(success=True, return_pct=report.metrics.total_return)
-            logger.info(f"回测完成：{strategy_name}，总收益 {report.metrics.total_return:.2%}")
-            return self._format_backtest_text(report)
-        except Exception as exc:
-            metric.finish(success=False, error=str(exc))
-            logger.error(f"回测失败：{exc}")
-            raise
-
-    async def list_strategies(self) -> str:
-        """列出可用策略。"""
-        strategies = registry.list_strategies()
-        lines = ["可用策略：", ""]
-        for idx, s in enumerate(strategies, 1):
-            lines.append(f"{idx}. {s['name']}（v{s['version']}）")
-            lines.append(f"   {s['description']}")
-        return "\n".join(lines)
-
     async def get_report(self, report_id: str) -> str:
         """获取报告内容。"""
         report_id = InputValidator.validate_report_id(report_id)
@@ -195,6 +205,7 @@ class OutLunaEngine:
         if not data:
             return f"未找到报告：{report_id}"
         import json
+
         return json.dumps(data, ensure_ascii=False, indent=2)
 
     async def list_reports(self, report_type: str | None = None) -> str:
@@ -205,18 +216,9 @@ class OutLunaEngine:
         lines = ["报告列表：", ""]
         for r in reports[:20]:
             lines.append(
-                f"- {r['report_id']} [{r['report_type']}] {r['title']} "
-                f"({r['created_at']})"
+                f"- {r['report_id']} [{r['report_type']}] {r['title']} ({r['created_at']})"
             )
         return "\n".join(lines)
-
-    async def compare_reports(self, id1: str, id2: str) -> str:
-        """对比两份报告。"""
-        id1 = InputValidator.validate_report_id(id1)
-        id2 = InputValidator.validate_report_id(id2)
-        result = self.report_generator.compare(id1, id2)
-        import json
-        return json.dumps(result, ensure_ascii=False, indent=2)
 
     async def add_watch(self, symbol: str) -> str:
         """将股票加入自选股池。
@@ -310,6 +312,224 @@ class OutLunaEngine:
         summary = self._build_watchlist_summary(reports, failed_symbols, task_dir)
         return summary
 
+    async def track_watchlist(self, days: int = 5) -> ReportOutput:
+        """追踪自选股池，返回最近 N 个交易日 + 今日行情的价格宽表。
+
+        每只股票占用一行，行首为"股票名称+股票代码"；列为 日期1...日期N、今日，
+        每个单元格展示"开盘价/收盘价（实时价）"。
+
+        Args:
+            days: 展示最近多少个交易日，默认 5 天。
+
+        Returns:
+            ReportOutput: ``text`` 为 Markdown 表格文本，``data`` 为生成图片用的 DataFrame。
+        """
+        symbols = self.watchlist_storage.list()
+        if not symbols:
+            return ReportOutput(text="自选股池为空，请先使用 /观察 股票代码 添加股票。")
+
+        from datetime import datetime, timedelta
+
+        end_date = datetime.now().strftime("%Y-%m-%d")
+        start_date = (datetime.now() - timedelta(days=max(days * 2, 30))).strftime("%Y-%m-%d")
+
+        metric = metrics.start_operation("track_watchlist", symbols=len(symbols))
+        ohlcv_data = self.gateway.get_ohlcv_multi(
+            symbols, start_date=start_date, end_date=end_date, bars=days
+        )
+        realtime_data = self._get_realtime_data(symbols)
+
+        date_columns = [f"日期{i}" for i in range(1, days + 1)]
+        wide_rows: list[dict[str, str]] = []
+        failed_symbols: list[str] = []
+        for symbol in symbols:
+            df = ohlcv_data.get(symbol)
+            if df is None or df.empty:
+                try:
+                    df = self.gateway.get_ohlcv(
+                        symbol, start_date=start_date, end_date=end_date, bars=days
+                    )
+                except Exception as exc:
+                    logger.warning(f"获取 {symbol} K 线失败：{exc}")
+                    failed_symbols.append(symbol)
+                    continue
+            if df is None or df.empty:
+                failed_symbols.append(symbol)
+                continue
+
+            name = self._get_stock_name(symbol)
+            stock_label = f"{name}{symbol}" if name != symbol else symbol
+            realtime = realtime_data.get(symbol, {})
+            row: dict[str, str] = {"股票": stock_label}
+
+            recent_df = df.tail(days).copy()
+            for idx, (_, r) in enumerate(recent_df.iterrows()):
+                open_price = self._format_price(r.get("open"))
+                close_price = self._format_price(r.get("close"))
+                row[date_columns[idx]] = f"{open_price}/{close_price}"
+
+            # 如果 K 线不足 days 根，剩余历史列补 "-/-"
+            for col in date_columns:
+                if col not in row:
+                    row[col] = "-/-"
+
+            row["今日"] = f"{realtime.get('open', '-')}/{realtime.get('price', '-')}"
+            wide_rows.append(row)
+
+        metric.finish(success=True, rows=len(wide_rows), failed=len(failed_symbols))
+        if not wide_rows:
+            return ReportOutput(text="未能获取到自选股池的行情数据，请稍后重试。")
+
+        result_df = pd.DataFrame(wide_rows, columns=["股票"] + date_columns + ["今日"])
+        table = self._format_markdown_table(result_df)
+
+        lines = [f"自选股池追踪（最近 {days} 个交易日 + 今日）：", "", table]
+        if failed_symbols:
+            lines.append("")
+            lines.append(f"以下股票获取数据失败：{', '.join(failed_symbols)}")
+        return ReportOutput(text="\n".join(lines), data=result_df)
+
+    def _get_realtime_data(self, symbols: list[str]) -> dict[str, dict[str, str]]:
+        """批量获取每只股票的最新实时价格与今日开盘价。
+
+        实时价格从 get_realtime_price 获取，今日开盘价从 get_close_summary 获取。
+        返回以内部标准代码为键、包含 price/open 的字典。
+        """
+        if not symbols:
+            return {}
+
+        result: dict[str, dict[str, str]] = {}
+        for symbol in symbols:
+            result[symbol] = {"price": "-", "open": "-"}
+
+        # 1. 获取实时价格
+        try:
+            price_df = self.gateway.get_realtime_price(symbols)
+            if price_df is not None and not price_df.empty:
+                price_col = self._find_realtime_price_column(price_df)
+                symbol_col = self._find_symbol_column(price_df)
+                if price_col:
+                    for idx, symbol in enumerate(symbols):
+                        row = self._find_realtime_row(price_df, symbol_col, symbol, idx)
+                        if row is not None and price_col in row:
+                            result[symbol]["price"] = self._format_price(row[price_col])
+        except Exception as exc:
+            logger.warning(f"获取实时价格失败：{exc}")
+
+        # 2. 获取今日开盘价（close_summary）
+        try:
+            summary_df = self.gateway.get_close_summary(symbols)
+            if summary_df is not None and not summary_df.empty:
+                open_col = self._find_open_column(summary_df)
+                symbol_col = self._find_symbol_column(summary_df)
+                if open_col:
+                    for idx, symbol in enumerate(symbols):
+                        row = self._find_realtime_row(summary_df, symbol_col, symbol, idx)
+                        if row is not None and open_col in row:
+                            result[symbol]["open"] = self._format_price(row[open_col])
+        except Exception as exc:
+            logger.warning(f"获取今日开盘价失败：{exc}")
+
+        return result
+
+    def _find_realtime_price_column(self, df: pd.DataFrame) -> str:
+        """从实时行情 DataFrame 中查找价格列。"""
+        candidates = [
+            "close",
+            "price",
+            "latest",
+            "最新价",
+            "现价",
+            "收盘价",
+            "last_price",
+        ]
+        for col in candidates:
+            if col in df.columns:
+                return col
+        # 兜底：查找包含 price/价的列
+        for col in df.columns:
+            if "价" in col or "price" in col.lower():
+                return col
+        return ""
+
+    def _find_open_column(self, df: pd.DataFrame) -> str:
+        """从 DataFrame 中查找今日开盘价列。"""
+        candidates = ["open", "今开", "开盘", "开盘价", "open_price"]
+        for col in candidates:
+            if col in df.columns:
+                return col
+        # 兜底：查找包含 open/开的列
+        for col in df.columns:
+            if "开" in col or "open" in col.lower():
+                return col
+        return ""
+
+    def _find_symbol_column(self, df: pd.DataFrame) -> str:
+        """从实时行情 DataFrame 中查找股票代码列。"""
+        candidates = ["symbol", "ticker", "thscode", "code", "代码", "股票代码"]
+        for col in candidates:
+            if col in df.columns:
+                return col
+        return ""
+
+    def _find_realtime_row(
+        self,
+        df: pd.DataFrame,
+        symbol_col: str,
+        symbol: str,
+        index: int,
+    ) -> pd.Series | None:
+        """在实时行情 DataFrame 中定位某只股票对应的行。
+
+        优先按 symbol 列匹配，失败时回退到输入顺序的第 index 行。
+        """
+        if not symbol_col or symbol_col not in df.columns:
+            return df.iloc[index] if index < len(df) else None
+
+        normalized = SymbolNormalizer.normalize(symbol)
+        for _, row in df.iterrows():
+            row_symbol = str(row.get(symbol_col, "")).strip()
+            if not row_symbol:
+                continue
+            if row_symbol == symbol:
+                return row
+            if SymbolNormalizer.normalize(row_symbol) == normalized:
+                return row
+            # 兼容无后缀 6 位代码
+            if row_symbol.replace(".", "") == symbol.split(".")[0]:
+                return row
+
+        return df.iloc[index] if index < len(df) else None
+
+    def _get_stock_name(self, symbol: str) -> str:
+        """获取股票简称，失败时返回代码本身。"""
+        try:
+            company_info = self.gateway.get_company_info(symbol)
+            name = company_info.get("ths_stock_short_name_stock", "")
+            if name and str(name).strip():
+                return str(name).strip()
+        except Exception as exc:
+            logger.debug(f"获取 {symbol} 公司名称失败：{exc}")
+        return symbol
+
+    def _format_price(self, value: Any) -> str:
+        """将价格格式化为两位小数，失败时返回原字符串。"""
+        try:
+            return f"{float(value):.2f}"
+        except (ValueError, TypeError):
+            return str(value)
+
+    def _format_markdown_table(self, df: pd.DataFrame) -> str:
+        """将 DataFrame 格式化为 Markdown 表格。"""
+        if df.empty:
+            return ""
+        headers = df.columns.tolist()
+        lines = ["| " + " | ".join(headers) + " |"]
+        lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
+        for _, row in df.iterrows():
+            lines.append("| " + " | ".join(str(row[col]) for col in headers) + " |")
+        return "\n".join(lines)
+
     def _save_single_analysis_to_folder(
         self,
         task_dir: Path,
@@ -320,12 +540,8 @@ class OutLunaEngine:
         sub_folder.mkdir(parents=True, exist_ok=True)
         summary_path = sub_folder / "总结.md"
         detailed_path = sub_folder / "详细数据.md"
-        summary_path.write_text(
-            self._format_analysis_markdown(report), encoding="utf-8"
-        )
-        detailed_path.write_text(
-            self._format_analysis_detailed_markdown(report), encoding="utf-8"
-        )
+        summary_path.write_text(self._format_analysis_markdown(report), encoding="utf-8")
+        detailed_path.write_text(self._format_analysis_detailed_markdown(report), encoding="utf-8")
 
     def _save_watchlist_reports(
         self,
@@ -438,11 +654,12 @@ class OutLunaEngine:
                         continue
                     if isinstance(value, list) and not value:
                         continue
-                    lines.append(f"**{key}**:")
+                    lines.append(f"**{key}**：")
                     if hasattr(value, "head"):
                         lines.append(value.head(10).to_markdown(index=False))
                     elif isinstance(value, dict):
                         import json
+
                         lines.append(
                             "```json\n"
                             + json.dumps(value, ensure_ascii=False, indent=2, default=str)
@@ -450,6 +667,7 @@ class OutLunaEngine:
                         )
                     elif isinstance(value, list):
                         import json
+
                         lines.append(
                             "```json\n"
                             + json.dumps(value, ensure_ascii=False, indent=2, default=str)
@@ -494,26 +712,4 @@ class OutLunaEngine:
                     lines.append("  - 暂无明确信号")
                 lines.append("")
 
-        return "\n".join(lines)
-
-    def _format_backtest_text(self, report) -> str:
-        """格式化回测报告为聊天文本。"""
-        lines = [
-            f"策略：{report.strategy_name}",
-            f"回测区间：{report.start_date.date()} ~ {report.end_date.date()}",
-            f"初始资金：{report.initial_capital:,.2f}",
-            "",
-            "绩效指标：",
-            f"- 总收益率：{report.metrics.total_return:.2%}",
-            f"- 年化收益率：{report.metrics.annualized_return:.2%}",
-            f"- 基准收益率（沪深300）：{report.metrics.benchmark_return:.2f}",
-            f"- 超额收益（Alpha）：{report.metrics.alpha:.2f}",
-            f"- 胜率：{report.metrics.win_rate:.2%}",
-            f"- 盈亏比：{report.metrics.profit_factor:.2f}",
-            f"- 最大回撤：{report.metrics.max_drawdown:.2%}",
-            f"- 夏普比率：{report.metrics.sharpe_ratio:.2f}",
-            f"- 总交易次数：{report.metrics.total_trades}",
-            "",
-            f"报告ID：{report.report_id}",
-        ]
         return "\n".join(lines)

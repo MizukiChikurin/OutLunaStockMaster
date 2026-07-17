@@ -38,7 +38,7 @@ class AkShareProvider(DataProvider):
         return cast(pd.DataFrame, func(*args, **kwargs))
 
     def _standardize_kline(self, df: pd.DataFrame) -> pd.DataFrame:
-        """标准化 K 线列名。"""
+        """标准化 K 线列名与日期格式。"""
         if df.empty:
             return df
         column_map = {
@@ -56,9 +56,55 @@ class AkShareProvider(DataProvider):
         }
         df = df.rename(columns={k: v for k, v in column_map.items() if k in df.columns})
         if "date" in df.columns:
-            df["date"] = pd.to_datetime(df["date"])
+            df["date"] = self._parse_dates(df["date"])
+            df = df.sort_values("date").reset_index(drop=True)
         cols = [c for c in ["date", "open", "high", "low", "close", "volume"] if c in df.columns]
         return df[cols]
+
+    def _parse_dates(self, series: pd.Series) -> pd.Series:
+        """将日期列统一解析为 datetime，兼容多种时间戳与字符串格式。"""
+        if pd.api.types.is_datetime64_any_dtype(series):
+            return series
+
+        def _is_reasonable(parsed: pd.Series) -> bool:
+            """判断解析后的日期是否落在合理年份范围。"""
+            if parsed.empty:
+                return True
+            try:
+                year = int(parsed.max().year)
+                return 1971 <= year <= 2099
+            except Exception:
+                return False
+
+        candidates: list[pd.Series] = []
+
+        try:
+            candidates.append(pd.to_datetime(series))
+        except Exception:
+            pass
+
+        try:
+            candidates.append(pd.to_datetime(series, unit="s"))
+        except Exception:
+            pass
+
+        try:
+            candidates.append(pd.to_datetime(series, unit="ms"))
+        except Exception:
+            pass
+
+        try:
+            candidates.append(pd.to_datetime(series.astype(str), format="%Y%m%d"))
+        except Exception:
+            pass
+
+        for parsed in candidates:
+            if _is_reasonable(parsed):
+                return parsed
+
+        if candidates:
+            return candidates[0]
+        return series
 
     def get_ohlcv(
         self,

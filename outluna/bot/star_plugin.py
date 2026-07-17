@@ -11,7 +11,11 @@
 
 import asyncio
 import sys
+from collections.abc import Awaitable, Callable
+from datetime import datetime
 from pathlib import Path
+
+import pandas as pd
 
 _plugin_dir = Path(__file__).parent
 
@@ -47,17 +51,27 @@ from astrbot.api.event import (  # type: ignore[import-not-found]
 
 import outluna
 from outluna.bot.astrbot_llm_provider import AstrBotLLMProvider
+from outluna.bot.auto_config import AutoWorkflowStorage, GroupAutoConfig, is_valid_time
+from outluna.bot.auto_scheduler import AutoScheduler
 from outluna.bot.commands import CommandHandler
 from outluna.bot.formatter import MessageFormatter
 from outluna.bot.plugin_config import apply_plugin_config, relocate_settings_paths
 from outluna.config import settings
+from outluna.data.models import ScanReport
 from outluna.data.providers.kimi_api.models import OAuthUnauthorizedError
 from outluna.data.providers.kimi_api.oauth import KimiOAuthClient
 from outluna.data.providers.kimi_api.storage import KimiCredentialStore
-from outluna.data.watchlist import WatchlistStorage
+from outluna.data.watchlist import SOURCE_AUTO, WatchlistStorage
 from outluna.engine import OutLunaEngine
 from outluna.report.generator import ReportGenerator, ReportStorage
+from outluna.strategy.fixed import FixedStrategy
 from outluna.utils.logger import setup_logging
+from outluna.utils.table_image import (
+    build_stock_selection_data,
+    build_watchlist_data,
+    get_template_string,
+)
+from outluna.utils.trade_calendar import TradeCalendar
 
 logger = setup_logging()
 
@@ -89,7 +103,6 @@ def _plugin_data_dir() -> Path:
 
 
 def _message(text: str) -> MessageChain:
-
     """把普通文本包装为 AstrBot 兼容的 MessageChain 消息链。
 
     同时清理 Kimi 数据源返回中无法解码的替换字符（\ufffd），
@@ -97,6 +110,26 @@ def _message(text: str) -> MessageChain:
     """
     cleaned = text.replace("\ufffd", "")
     return MessageChain().message(cleaned)
+
+
+def _is_txt_flag(text: str) -> tuple[bool, str]:
+    """检测并移除文本中的 --txt 标志。
+
+    Args:
+        text: 用户输入的命令参数字符串。
+
+    Returns:
+        (是否包含 --txt 标志, 移除标志并压缩空白后的文本)。
+    """
+    parts = text.split()
+    has_flag = False
+    cleaned: list[str] = []
+    for part in parts:
+        if part == "--txt":
+            has_flag = True
+        else:
+            cleaned.append(part)
+    return has_flag, " ".join(cleaned)
 
 
 class OutLunaPlugin(star.Star):
@@ -117,6 +150,7 @@ class OutLunaPlugin(star.Star):
         logger.info(f"OutLuna 插件数据目录：{data_dir}")
         logger.info(f"Kimi 凭证文件路径：{settings.db_path.parent / 'kimi_api_credentials.json'}")
         logger.info(f"旧数据目录：{old_data_dir}")
+        self.image_tables_enabled = getattr(settings, "image_tables_enabled", True)
         report_storage = ReportStorage(base_dir=tasks_dir)
         # AstrBot 场景下复用其已配置的 LLM
         self.engine = OutLunaEngine(
@@ -126,6 +160,16 @@ class OutLunaPlugin(star.Star):
         self.engine.watchlist_storage = WatchlistStorage(data_dir / "watchlist.json")
         self.handler = CommandHandler(self.engine)
         self.formatter = MessageFormatter()
+        # 自动化工作流：按群配置存储 + 交易日历 + 定时调度器
+        self.auto_storage = AutoWorkflowStorage(data_dir / "auto_workflow.json")
+        self.trade_calendar = TradeCalendar(settings.cache_dir / "trade_calendar.json")
+        self.scheduler = AutoScheduler(
+            storage=self.auto_storage,
+            trade_calendar=self.trade_calendar,
+            on_track=self._push_track_watchlist,
+            on_scan=self._push_auto_scan,
+            on_cleanup=self._cleanup_expired_auto,
+        )
 
     async def initialize(self) -> None:
         """插件初始化。"""
@@ -133,47 +177,15 @@ class OutLunaPlugin(star.Star):
             f"OutLuna 插件初始化，版本：{outluna.__version__}，路径：{Path(__file__).parent}"
         )
         await self.engine.initialize()
+        await self.scheduler.start()
+
+    async def terminate(self) -> None:
+        """插件禁用或重载时停止自动化调度器。"""
+        await self.scheduler.stop()
 
     def _get_llm_provider(self, event: AstrMessageEvent) -> AstrBotLLMProvider:
         """为当前事件创建 AstrBot LLM Provider。"""
         return AstrBotLLMProvider(self.context, event)
-
-    @filter.command("scan")
-    async def scan_stocks(self, event: AstrMessageEvent, strategy_name: str = "十字星"):
-        """执行策略扫描。用法：/scan [策略名]"""
-        await event.send(_message("正在执行策略扫描，请稍候..."))
-        try:
-            text = await self.engine.scan(strategy_name)
-            await event.send(_message(self.formatter.truncate(text)))
-        except Exception as exc:
-            await event.send(_message(f"扫描失败：{exc}"))
-
-    @filter.command("test_kimi")
-    async def test_kimi(self, event: AstrMessageEvent) -> None:
-        """测试 Kimi API 数据源。用法：/test_kimi"""
-        provider = self.engine.gateway.providers.get("kimi_api")
-        if provider is None:
-            await event.send(_message("kimi_api 提供商未启用，请检查 data/outluna_config.json 中 prefer_kimi_api 是否为 true。"))
-            return
-        method = getattr(provider, "test_realtime_price", None)
-        if not callable(method):
-            await event.send(_message("当前 kim_api 提供商不支持诊断接口。"))
-            return
-        await event.send(_message("正在测试 Kimi API（000001.SZ realtime_price），请稍候..."))
-        try:
-            text, df = method(["000001.SZ"])
-            rows, cols = len(df), len(df.columns)
-            preview = df.head(3).to_markdown(index=False) if rows else "无数据"
-            msg = (
-                "Kimi API 诊断结果（000001.SZ realtime_price）：\n\n"
-                f"[原始响应]\n{text[:1200]}{'...' if len(text) > 1200 else ''}\n\n"
-                f"[解析结果] {rows} 行 × {cols} 列\n"
-                f"列名：{list(df.columns)}\n\n"
-                f"[前 3 行]\n{preview}"
-            )
-            await event.send(_message(msg))
-        except Exception as exc:
-            await event.send(_message(f"Kimi API 测试失败：{exc}"))
 
     async def _refresh_kimi_credentials(self, event: AstrMessageEvent, error_message: str) -> None:
         """检测到 Kimi 401 凭证错误时，使用内置 OAuth 客户端自动恢复。
@@ -210,15 +222,11 @@ class OutLunaPlugin(star.Star):
         is_webchat = platform_id == "webchat"
         if not is_admin and not is_private_chat and not is_webchat:
             await event.send(
-                _message(
-                    "Kimi 数据源凭证已过期，请让管理员发送 /选股 触发授权登录后重试。"
-                )
+                _message("Kimi 数据源凭证已过期，请让管理员发送 /选股 触发授权登录后重试。")
             )
             return
 
-        await event.send(
-            _message("自动刷新 token 失败，正在发起 Kimi 登录流程，请查看授权链接...")
-        )
+        await event.send(_message("自动刷新 token 失败，正在发起 Kimi 登录流程，请查看授权链接..."))
         try:
             auth = await asyncio.to_thread(oauth.request_device_authorization)
             link = auth.verification_uri_complete or auth.verification_uri
@@ -259,53 +267,337 @@ class OutLunaPlugin(star.Star):
         except Exception as exc:
             logger.warning(f"自动发起 Kimi 登录失败：{exc}")
             await event.send(
-                _message(
-                    "自动恢复 Kimi 凭证失败。请检查网络或让管理员手动配置 Kimi 凭证后重试。"
-                )
+                _message("自动恢复 Kimi 凭证失败。请检查网络或让管理员手动配置 Kimi 凭证后重试。")
             )
+
+    async def _build_table_image(self, template: str, data: dict) -> str | None:
+        """调用 AstrBot 内置 T2I 服务将模板与数据渲染为图片。
+
+        Args:
+            template: Jinja2 HTML 模板字符串。
+            data: 模板渲染所需数据字典。
+
+        Returns:
+            本地图片文件路径；渲染不可用或失败时返回 None。
+        """
+        html_render: Callable[..., Awaitable[str]] | None = getattr(self, "html_render", None)
+        if not callable(html_render):
+            logger.warning("当前 AstrBot 版本未提供 self.html_render，已回退到文本")
+            return None
+        try:
+            return await html_render(
+                template,
+                data,
+                return_url=False,
+                options={"full_page": True, "type": "jpeg", "quality": 90},
+            )
+        except Exception as exc:
+            logger.warning(f"图片表格渲染失败：{exc}")
+            return None
+
+    async def _send_message_to(self, umo: str, chain: MessageChain) -> None:
+        """向指定会话主动发送消息链，失败时记录日志。"""
+        try:
+            sent = await self.context.send_message(umo, chain)
+            if not sent:
+                logger.warning(f"主动消息未送达，未找到匹配平台：{umo}")
+        except Exception as exc:
+            logger.error(f"主动消息发送失败[{umo}]：{exc}")
+
+    async def _push_track_watchlist(self, umo: str) -> None:
+        """自动化任务：执行追踪股池并将结果推送到指定群聊。"""
+        try:
+            result = await self.engine.track_watchlist()
+        except Exception as exc:
+            await self._send_message_to(umo, _message(f"自动化追踪股池失败：{exc}"))
+            return
+        if (
+            self.image_tables_enabled
+            and isinstance(result.data, pd.DataFrame)
+            and not result.data.empty
+        ):
+            template = get_template_string()
+            days = 5  # track_watchlist 默认展示最近 5 个交易日
+            data = build_watchlist_data(result.data, days)
+            image_path = await self._build_table_image(template, data)
+            if image_path:
+                await self._send_message_to(umo, MessageChain().file_image(image_path))
+                return
+        await self._send_message_to(umo, _message(self.formatter.truncate(result.text)))
+
+    async def _push_auto_scan(self, umo: str) -> None:
+        """自动化任务：执行固定策略选股，达标股票自动入库并推送结果。
+
+        入库规则：LLM 评分大于等于群配置阈值的股票加入股池（来源标记 auto）；
+        已在池中的 auto 股票刷新加入日期（重新计算 5 个交易日保留期）；
+        手动添加的股票保持原有元数据不变。
+        """
+        config = self.auto_storage.get_group(umo)
+        if not config.strategy:
+            await self._send_message_to(
+                umo,
+                _message("自动化选股未配置策略，已跳过。\n请使用 /自动化 设置 策略 <策略名> 进行配置。"),
+            )
+            return
+        self.engine.llm_provider = AstrBotLLMProvider(self.context, unified_msg_origin=umo)
+        # 定时任务场景无法交互式授权，Kimi 凭证失效时直接失败并推送提示
+        self.engine.on_kimi_auth_error = None
+        try:
+            result = await self.engine.select_stocks_by_preset(config.strategy)
+        except Exception as exc:
+            await self._send_message_to(umo, _message(f"自动化选股失败（策略：{config.strategy}）：{exc}"))
+            return
+
+        # 发送选股结果（图片优先，与 /固定策略 命令一致）
+        if (
+            self.image_tables_enabled
+            and isinstance(result.data, ScanReport)
+            and result.data.qualified
+        ):
+            template = get_template_string()
+            data = build_stock_selection_data(result.data)
+            image_path = await self._build_table_image(template, data)
+            if image_path:
+                await self._send_message_to(umo, MessageChain().file_image(image_path))
+            else:
+                await self._send_message_to(
+                    umo, _message("图片生成失败，已发送文本。\n" + self.formatter.truncate(result.text))
+                )
+        else:
+            await self._send_message_to(umo, _message(self.formatter.truncate(result.text)))
+
+        # 达标股票入库并推送入库摘要
+        summary = self._collect_qualified_to_watchlist(result.data, config, umo)
+        await self._send_message_to(umo, _message(summary))
+
+    def _collect_qualified_to_watchlist(
+        self,
+        report: ScanReport | None,
+        config: GroupAutoConfig,
+        umo: str,
+    ) -> str:
+        """将评分达标的选股结果写入自选股池，返回入库摘要文本。"""
+        today = datetime.now().date().isoformat()
+        added: list[str] = []
+        refreshed: list[str] = []
+        kept_manual: list[str] = []
+        if isinstance(report, ScanReport):
+            for item in report.qualified:
+                score = item.match_score if item.match_score is not None else 0.0
+                if score < config.score_threshold:
+                    continue
+                label = f"{item.name or item.symbol}({item.symbol}) {score:.0f}分"
+                existing = self.engine.watchlist_storage.get_item(item.symbol)
+                if existing is None:
+                    self.engine.watchlist_storage.add(item.symbol, source=SOURCE_AUTO, added_date=today)
+                    added.append(label)
+                elif existing.source == SOURCE_AUTO:
+                    self.engine.watchlist_storage.refresh_added_date(item.symbol, today)
+                    refreshed.append(label)
+                else:
+                    kept_manual.append(label)
+        lines = [
+            f"自动选股入库结果（策略：{config.strategy}，阈值：{config.score_threshold:g}分）："
+        ]
+        if added:
+            lines.append(f"新加入股池（保留5个交易日）：{'、'.join(added)}")
+        if refreshed:
+            lines.append(f"重复推荐，已刷新保留期：{'、'.join(refreshed)}")
+        if kept_manual:
+            lines.append(f"手动添加股票保持不变：{'、'.join(kept_manual)}")
+        if not added and not refreshed and not kept_manual:
+            lines.append("无评分达标股票，股池未变更。")
+        logger.info(f"自动选股入库[{umo}]：新增{len(added)}，刷新{len(refreshed)}，手动保留{len(kept_manual)}")
+        return "\n".join(lines)
+
+    async def _cleanup_expired_auto(self) -> None:
+        """自动化任务：移除保留期满的自动入库股票，并通知已开启的群聊。"""
+        trade_dates = await asyncio.to_thread(self.trade_calendar.get_trade_dates)
+        removed = self.engine.watchlist_storage.remove_expired_auto(trade_dates, keep_days=5)
+        if not removed:
+            return
+        text = f"以下自动入库股票已保留满 5 个交易日，自动移出股池：{', '.join(removed)}"
+        for umo, config in self.auto_storage.list_groups().items():
+            if config.enabled:
+                await self._send_message_to(umo, _message(text))
+
+    def _format_auto_config(self, umo: str) -> str:
+        """格式化当前群聊的自动化配置状态文本。"""
+        config = self.auto_storage.get_group(umo)
+        presets = FixedStrategy.list_presets()
+        lines = [
+            "本群自动化工作流配置：",
+            f"- 状态：{'已开启' if config.enabled else '已关闭'}",
+            f"- 追踪股池推送时间：{'、'.join(config.track_times)}",
+            f"- 自动选股时间：{config.scan_time}",
+            f"- 选股策略：{config.strategy or '未配置'}",
+            f"- 入库评分阈值：{config.score_threshold:g} 分",
+            "",
+            "配置命令：",
+            "/自动化 开 | /自动化 关",
+            "/自动化 设置 推送时间 09:30 13:30",
+            "/自动化 设置 选股时间 16:00",
+            f"/自动化 设置 策略 <策略名>（可用：{', '.join(presets) if presets else '无'}）",
+            "/自动化 设置 阈值 70",
+        ]
+        return "\n".join(lines)
+
+    async def _handle_auto_set(self, event: AstrMessageEvent, umo: str, args: list[str]) -> None:
+        """处理 /自动化 设置 子命令。"""
+        if not args:
+            await event.send(_message("用法：/自动化 设置 推送时间|选股时间|策略|阈值 <值>"))
+            return
+        key = args[0]
+        values = args[1:]
+        config = self.auto_storage.get_group(umo)
+
+        if key == "推送时间":
+            if not values or any(not is_valid_time(v) for v in values):
+                await event.send(_message("时间格式错误，应为 HH:MM，例如：/自动化 设置 推送时间 09:30 13:30"))
+                return
+            config.track_times = sorted(set(values))
+            self.auto_storage.save_group(umo, config)
+            await event.send(_message(f"追踪股池推送时间已更新：{'、'.join(config.track_times)}"))
+        elif key == "选股时间":
+            if len(values) != 1 or not is_valid_time(values[0]):
+                await event.send(_message("时间格式错误，应为 HH:MM，例如：/自动化 设置 选股时间 16:00"))
+                return
+            config.scan_time = values[0]
+            self.auto_storage.save_group(umo, config)
+            await event.send(_message(f"自动选股时间已更新：{config.scan_time}"))
+        elif key == "策略":
+            if len(values) != 1:
+                await event.send(_message("用法：/自动化 设置 策略 <策略名>"))
+                return
+            presets = FixedStrategy.list_presets()
+            if values[0] not in presets:
+                await event.send(
+                    _message(f"策略不存在：{values[0]}\n可用策略：{', '.join(presets) if presets else '无'}")
+                )
+                return
+            config.strategy = values[0]
+            self.auto_storage.save_group(umo, config)
+            await event.send(_message(f"自动选股策略已更新：{config.strategy}"))
+        elif key == "阈值":
+            if len(values) != 1:
+                await event.send(_message("用法：/自动化 设置 阈值 <0-100的分数>"))
+                return
+            try:
+                threshold = float(values[0])
+            except ValueError:
+                await event.send(_message("阈值格式错误，应为 0-100 的数字，例如：/自动化 设置 阈值 70"))
+                return
+            if not 0 <= threshold <= 100:
+                await event.send(_message("阈值需在 0-100 之间。"))
+                return
+            config.score_threshold = threshold
+            self.auto_storage.save_group(umo, config)
+            await event.send(_message(f"入库评分阈值已更新：{config.score_threshold:g} 分"))
+        else:
+            await event.send(_message(f"未知设置项：{key}\n支持：推送时间、选股时间、策略、阈值"))
+
+    @filter.command("自动化")
+    async def auto_workflow(self, event: AstrMessageEvent, args: str = ""):
+        """配置自动化工作流。用法：/自动化 [开|关|设置 ...]"""
+        umo = event.unified_msg_origin
+        parts = args.split()
+        if not parts:
+            await event.send(_message(self._format_auto_config(umo)))
+            return
+        sub = parts[0]
+        if sub == "开":
+            config = self.auto_storage.get_group(umo)
+            config.enabled = True
+            self.auto_storage.save_group(umo, config)
+            await event.send(_message("已开启本群自动化工作流。\n" + self._format_auto_config(umo)))
+        elif sub == "关":
+            config = self.auto_storage.get_group(umo)
+            config.enabled = False
+            self.auto_storage.save_group(umo, config)
+            await event.send(_message("已关闭本群自动化工作流。"))
+        elif sub == "设置":
+            await self._handle_auto_set(event, umo, parts[1:])
+        else:
+            await event.send(_message(f"未知子命令：{sub}\n" + self._format_auto_config(umo)))
 
     @filter.command("选股")
     async def select_stocks(self, event: AstrMessageEvent, requirements: str = ""):
         """执行用户自定义选股。用法：/选股 <选股要求>"""
+        txt_flag, requirements = _is_txt_flag(requirements)
         await event.send(_message("正在根据您的要求执行选股，请稍候..."))
         try:
             llm_provider = self._get_llm_provider(event)
             logger.info(f"/选股 使用 AstrBot LLM Provider，可用：{llm_provider.available}")
             self.engine.llm_provider = llm_provider
             self.engine.on_kimi_auth_error = lambda msg: self._refresh_kimi_credentials(event, msg)
-            text = await self.engine.select_stocks(requirements)
-            await event.send(_message(self.formatter.truncate(text)))
+            result = await self.engine.select_stocks(requirements)
+            if (
+                not txt_flag
+                and self.image_tables_enabled
+                and isinstance(result.data, ScanReport)
+                and result.data.qualified
+            ):
+                template = get_template_string()
+                data = build_stock_selection_data(result.data)
+                image_path = await self._build_table_image(template, data)
+                if image_path:
+                    await event.send(MessageChain().file_image(image_path))
+                else:
+                    await event.send(
+                        _message(
+                            "图片生成失败，已发送文本。\n" + self.formatter.truncate(result.text)
+                        )
+                    )
+            else:
+                await event.send(_message(self.formatter.truncate(result.text)))
         except Exception as exc:
             await event.send(_message(f"选股失败：{exc}"))
 
-    @filter.command("analyze")
+    @filter.command("固定策略")
+    async def select_stocks_by_preset(self, event: AstrMessageEvent, preset_name: str = ""):
+        """执行固定策略选股。用法：/固定策略 <策略名称>"""
+        txt_flag, preset_name = _is_txt_flag(preset_name)
+        await event.send(_message("正在执行固定策略选股，请稍候..."))
+        try:
+            llm_provider = self._get_llm_provider(event)
+            logger.info(f"/固定策略 使用 AstrBot LLM Provider，可用：{llm_provider.available}")
+            self.engine.llm_provider = llm_provider
+            self.engine.on_kimi_auth_error = lambda msg: self._refresh_kimi_credentials(event, msg)
+            result = await self.engine.select_stocks_by_preset(preset_name)
+            if (
+                not txt_flag
+                and self.image_tables_enabled
+                and isinstance(result.data, ScanReport)
+                and result.data.qualified
+            ):
+                template = get_template_string()
+                data = build_stock_selection_data(result.data)
+                image_path = await self._build_table_image(template, data)
+                if image_path:
+                    await event.send(MessageChain().file_image(image_path))
+                else:
+                    await event.send(
+                        _message(
+                            "图片生成失败，已发送文本。\n" + self.formatter.truncate(result.text)
+                        )
+                    )
+            else:
+                await event.send(_message(self.formatter.truncate(result.text)))
+        except Exception as exc:
+            await event.send(_message(f"固定策略选股失败：{exc}"))
+
+    @filter.command("分析")
     async def analyze_stock(self, event: AstrMessageEvent, symbol: str):
-        """分析指定股票。用法：/analyze 600519"""
+        """分析指定股票。用法：/分析 600519"""
         await event.send(_message(f"正在分析 {symbol}，请稍候..."))
         try:
             llm_provider = self._get_llm_provider(event)
-            logger.info(f"/analyze 使用 AstrBot LLM Provider，可用：{llm_provider.available}")
+            logger.info(f"/分析 使用 AstrBot LLM Provider，可用：{llm_provider.available}")
             self.engine.llm_provider = llm_provider
             text = await self.engine.analyze(symbol)
             await event.send(_message(self.formatter.truncate(text)))
         except Exception as exc:
             await event.send(_message(f"分析失败：{exc}"))
-
-    @filter.command("backtest")
-    async def run_backtest(self, event: AstrMessageEvent, strategy_name: str, days: int = 90):
-        """执行策略回测。用法：/backtest 十字星 90"""
-        await event.send(_message(f"正在执行 {strategy_name} 策略回测（近 {days} 天），请稍候..."))
-        try:
-            text = await self.engine.backtest(strategy_name, days)
-            await event.send(_message(self.formatter.truncate(text)))
-        except Exception as exc:
-            await event.send(_message(f"回测失败：{exc}"))
-
-    @filter.command("strategy")
-    async def list_strategies(self, event: AstrMessageEvent):
-        """列出可用策略"""
-        text = await self.engine.list_strategies()
-        await event.send(_message(text))
 
     @filter.command("观察")
     async def add_watch(self, event: AstrMessageEvent, symbol: str):
@@ -344,6 +636,36 @@ class OutLunaPlugin(star.Star):
         except Exception as exc:
             await event.send(_message(f"分析股池失败：{exc}"))
 
+    @filter.command("追踪股池")
+    async def track_watchlist(self, event: AstrMessageEvent, args: str = ""):
+        """追踪自选股池行情。用法：/追踪股池"""
+        txt_flag, _ = _is_txt_flag(args)
+        await event.send(_message("正在拉取自选股池行情，请稍候..."))
+        try:
+            result = await self.engine.track_watchlist()
+            if (
+                not txt_flag
+                and self.image_tables_enabled
+                and isinstance(result.data, pd.DataFrame)
+                and not result.data.empty
+            ):
+                template = get_template_string()
+                days = 5  # track_watchlist 默认展示最近 5 个交易日
+                data = build_watchlist_data(result.data, days)
+                image_path = await self._build_table_image(template, data)
+                if image_path:
+                    await event.send(MessageChain().file_image(image_path))
+                else:
+                    await event.send(
+                        _message(
+                            "图片生成失败，已发送文本。\n" + self.formatter.truncate(result.text)
+                        )
+                    )
+            else:
+                await event.send(_message(self.formatter.truncate(result.text)))
+        except Exception as exc:
+            await event.send(_message(f"追踪股池失败：{exc}"))
+
     @filter.command("report")
     async def get_report(self, event: AstrMessageEvent, report_id: str = ""):
         """查看报告。用法：/report [报告ID]"""
@@ -351,13 +673,4 @@ class OutLunaPlugin(star.Star):
             text = await self.engine.list_reports()
         else:
             text = await self.engine.get_report(report_id)
-        await event.send(_message(self.formatter.truncate(text)))
-
-    @filter.command("compare")
-    async def compare_reports(self, event: AstrMessageEvent, id1: str = "", id2: str = ""):
-        """对比两份报告。用法：/compare <id1> <id2>"""
-        if not id1 or not id2:
-            await event.send(_message("用法：/compare <id1> <id2>"))
-            return
-        text = await self.engine.compare_reports(id1, id2)
         await event.send(_message(self.formatter.truncate(text)))

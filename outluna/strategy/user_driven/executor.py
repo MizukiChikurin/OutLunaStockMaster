@@ -408,6 +408,12 @@ class StrategyExecutor:
             "isinstance": isinstance,
             "hasattr": hasattr,
             "getattr": getattr,
+            "Exception": Exception,
+            "ValueError": ValueError,
+            "TypeError": TypeError,
+            "KeyError": KeyError,
+            "IndexError": IndexError,
+            "RuntimeError": RuntimeError,
             "__import__": __import__,
         }
         namespace: dict[str, Any] = {

@@ -15,21 +15,33 @@ class AstrBotLLMProvider(LLMProvider):
     适用于插件运行场景，自动复用用户在 AstrBot WebUI 中配置的模型。
     """
 
-    def __init__(self, context: Any, event: Any):
+    def __init__(self, context: Any, event: Any = None, unified_msg_origin: str | None = None):
         """初始化。
 
         Args:
             context: AstrBot 的 star.Context 实例。
             event: AstrBot 的 AstrMessageEvent 实例，用于获取当前 provider。
+                定时任务等无消息事件的场景可传 None，并通过
+                ``unified_msg_origin`` 直接指定会话来源。
+            unified_msg_origin: 会话来源标识（umo），优先于 event 取值。
         """
         self.context = context
         self.event = event
+        self._unified_msg_origin = unified_msg_origin
+
+    def _umo(self) -> str | None:
+        """获取当前会话来源标识，优先使用显式指定的 umo。"""
+        if self._unified_msg_origin:
+            return self._unified_msg_origin
+        if self.event is not None:
+            return getattr(self.event, "unified_msg_origin", None)
+        return None
 
     @property
     def available(self) -> bool:
         """AstrBot 是否已配置 LLM。"""
         try:
-            prov = self.context.get_using_provider(self.event.unified_msg_origin)
+            prov = self.context.get_using_provider(self._umo())
             return prov is not None
         except Exception:
             return False
@@ -42,7 +54,7 @@ class AstrBotLLMProvider(LLMProvider):
         temperature: float = 0.2,
     ) -> Any:
         """调用 AstrBot LLM，并尝试将文本结果解析为结构化对象。"""
-        prov = self.context.get_using_provider(self.event.unified_msg_origin)
+        prov = self.context.get_using_provider(self._umo())
         if prov is None:
             raise RuntimeError("AstrBot 未配置可用的 LLM Provider")
 

@@ -342,6 +342,32 @@ class DataGateway:
 
         return pd.concat(results, ignore_index=True) if results else pd.DataFrame()
 
+    def get_close_summary(self, symbols: list[str]) -> pd.DataFrame:
+        """获取日线收盘/开盘汇总数据，输入代码会自动标准化。
+
+        主要用于获取今日开盘价等日线汇总信息，以 Kimi Datasource 为核心。
+        """
+        symbols = self._normalize_symbols(symbols)
+        if not symbols:
+            return pd.DataFrame()
+
+        results = []
+        for i in range(0, len(symbols), 3):
+            batch = symbols[i : i + 3]
+            kimi_provider = self._get_kimi_provider()
+            if kimi_provider is not None:
+                try:
+                    df = kimi_provider.get_close_summary(batch)
+                    results.append(df)
+                    continue
+                except Exception as exc:
+                    logger.warning(f"Kimi close_summary 分批调用失败：{exc}")
+            # 降级到其他 provider
+            df = self._call_with_fallback_df("get_close_summary", batch)
+            results.append(df)
+
+        return pd.concat(results, ignore_index=True) if results else pd.DataFrame()
+
     def get_stock_list(self, market: str = "A") -> list[str]:
         """获取市场股票列表，返回统一标准化的内部格式代码。"""
         key = self._cache_key("get_stock_list", market)

@@ -26,8 +26,13 @@ logger = setup_logging()
 
 
 class StockReasonOutput(BaseModel):
-    """LLM 为单只股票生成的推荐理由。"""
+    """LLM 为单只股票生成的推荐理由与评分。"""
 
+    score: float = Field(
+        ge=0,
+        le=100,
+        description="综合评分（0-100），由 LLM 根据用户选股要求和股票数据给出，越高越符合要求",
+    )
     reasons: list[str] = Field(
         default_factory=list,
         description="推荐理由列表，每条理由应结合技术指标说明为什么符合用户要求",
@@ -94,6 +99,12 @@ class UserDrivenStrategy(StrategyBase):
 
         parser = UserRequirementParser(self.llm_provider)
         self.config = await parser.parse(self.requirements_text)
+        return await self._execute_config(gateway)
+
+    async def _execute_config(self, gateway) -> dict[str, Any]:
+        """根据当前已解析的策略配置执行选股流程。"""
+        if self.config is None:
+            raise RuntimeError("策略配置未初始化")
 
         # 安全边界：正数时强制限制不超过 100；0 表示不限制，保持为 0
         if self.config.max_analyze > 0:
@@ -117,7 +128,9 @@ class UserDrivenStrategy(StrategyBase):
                 }
             except KimiAuthError as exc:
                 if attempt == 0 and self.on_auth_error is not None:
-                    logger = __import__("outluna.utils.logger", fromlist=["setup_logging"]).setup_logging()
+                    logger = __import__(
+                        "outluna.utils.logger", fromlist=["setup_logging"]
+                    ).setup_logging()
                     logger.warning(f"Kimi 凭证过期，尝试刷新（第 {attempt + 1} 次）：{exc}")
                     await self.on_auth_error(str(exc))
                     await asyncio.sleep(self.AUTH_REFRESH_WAIT_SECONDS)
@@ -127,8 +140,7 @@ class UserDrivenStrategy(StrategyBase):
                 ) from exc
             except TimeoutError as exc:
                 raise RuntimeError(
-                    f"选股执行超时（>{execute_timeout}秒），"
-                    "请缩小范围或稍后重试"
+                    f"选股执行超时（>{execute_timeout}秒），请缩小范围或稍后重试"
                 ) from exc
 
         # 循环正常结束仅可能为第二次 KimiAuthError 已抛出，此处兜底防止 mypy 警告
@@ -155,11 +167,12 @@ class UserDrivenStrategy(StrategyBase):
         self,
         results: list[ScanResult],
     ) -> None:
-        """为通过初筛的候选股票生成推荐理由。"""
+        """为通过初筛的候选股票生成 LLM 评分与推荐理由。"""
         passed = [r for r in results if not r.vetos]
         if not passed:
             return
 
+        # 控制 LLM 调用成本，最多为前 30 只生成评分与理由
         target_stocks = passed[:30]
         tasks = [self._generate_reason_for_stock(r) for r in target_stocks]
         await asyncio.gather(*tasks)
@@ -168,7 +181,7 @@ class UserDrivenStrategy(StrategyBase):
         self,
         result: ScanResult,
     ) -> None:
-        """使用 LLM 为单只股票生成推荐理由。"""
+        """使用 LLM 为单只股票生成综合评分和推荐理由。"""
         if self.llm_provider is None:
             return
         try:
@@ -183,7 +196,9 @@ class UserDrivenStrategy(StrategyBase):
                     temperature=0.3,
                 ),
             )
+            result.match_score = max(0.0, min(100.0, output.score))
             result.notes = output.reasons or result.notes
+            result.score_details["LLM综合评分"] = result.match_score
         except Exception as exc:
             logger.warning(f"为 {result.symbol} 生成推荐理由失败：{exc}")
 
@@ -191,12 +206,17 @@ class UserDrivenStrategy(StrategyBase):
         """构建生成推荐理由的系统提示词。"""
         return (
             "你是一位资深量化分析师。请根据用户选股要求以及股票的技术指标数据，"
-            "为该股给出 3-5 条简洁的推荐理由。\n\n"
+            "为该股给出 0-100 的综合评分和 3-5 条简洁的推荐理由。\n\n"
+            "评分标准：\n"
+            "- 90-100：非常符合用户要求，各项指标均表现优异；\n"
+            "- 70-89：较为符合用户要求，大部分指标支持；\n"
+            "- 50-69：部分符合用户要求，但存在一定风险或不确定性；\n"
+            "- 0-49：不符合或勉强符合用户要求，需谨慎。\n\n"
             "推荐理由要求：\n"
             "1. 每条理由必须结合具体技术指标（如均线、RSI、MACD、资金流向、筹码分布等）说明；\n"
             "2. 理由应直接回应用户选股要求，避免空泛描述；\n"
             "3. 若某些指标不支持用户要求，也应在理由中简要说明风险。\n\n"
-            "输出必须是合法 JSON，包含 reasons（字符串数组）。"
+            "输出必须是合法 JSON，包含 score（浮点数）和 reasons（字符串数组）。"
         )
 
     def _build_reason_user_prompt(
@@ -216,7 +236,7 @@ class UserDrivenStrategy(StrategyBase):
             f"当日涨跌幅：{result.change_pct}%\n"
             f"当日成交额（亿）：{result.turnover:.2f}\n\n"
             f"主要技术指标：\n{metrics_text}\n\n"
-            "请给出推荐理由。"
+            "请给出综合评分和推荐理由。"
         )
 
     def build_scan_report(self, report_id: str) -> ScanReport:
@@ -228,9 +248,17 @@ class UserDrivenStrategy(StrategyBase):
 
         vetoed = [r for r in results if r.vetos]
         passed = [r for r in results if not r.vetos]
-        # 选股仅做通过性判断，不做量化评分，所有通过初筛的股票均作为候选。
-        qualified = passed
+
+        # 所有通过初筛的候选股票均进入推荐列表，按 LLM 评分从高到低排序
+        passed_sorted = sorted(
+            passed,
+            key=lambda x: x.match_score if x.match_score is not None and x.match_score >= 0 else -1,
+            reverse=True,
+        )
+        qualified = passed_sorted
         watch_list: list[ScanResult] = []
+        for r in qualified:
+            r.recommendation = "推荐"
 
         task_folder = self._build_task_folder(config)
 
@@ -279,7 +307,9 @@ class UserDrivenStrategy(StrategyBase):
         ]
         if reason_counts:
             top_reasons = sorted(reason_counts.items(), key=lambda x: x[1], reverse=True)[:3]
-            lines.append("主要否决原因：" + "、".join(f"{k}（{v}只）" for k, v in top_reasons) + "。")
+            lines.append(
+                "主要否决原因：" + "、".join(f"{k}（{v}只）" for k, v in top_reasons) + "。"
+            )
         return "".join(lines)
 
     def _build_final_conclusion(
@@ -288,26 +318,23 @@ class UserDrivenStrategy(StrategyBase):
         watch_list: list[ScanResult],
         config: UserStrategyConfig,
     ) -> str:
-        """生成最终结论文本。
-
-        只要存在通过初筛的股票，就作为候选推荐，不再做量化评分。
-        """
+        """生成最终结论文本。"""
         if not qualified:
-            return (
-                "无通过初筛的股票，本次不推荐标的。\n"
-                "建议：放宽选股条件或等待市场环境改善。"
-            )
+            return "无通过初筛的股票，本次不推荐标的。\n建议：放宽选股条件或等待市场环境改善。"
 
         lines = [
-            f"按用户要求筛选后，共推荐 {len(qualified)} 只候选股：",
+            f"按用户要求筛选后，共推荐 {len(qualified)} 只候选股，按 LLM 评分从高到低排列：",
             "",
         ]
         for i, r in enumerate(qualified[:10], 1):
-            lines.append(f"{i}. {r.name}（{r.symbol}）")
+            score_text = f"{r.match_score:.1f}分" if r.match_score is not None else "无评分"
+            lines.append(f"{i}. {r.name}（{r.symbol}），评分：{score_text}")
             if r.notes:
                 lines.append(f"   推荐理由：{r.notes[0]}")
         if len(qualified) > 10:
             lines.append(f"...（共 {len(qualified)} 只，此处仅展示前 10）")
+        lines.append("")
+        lines.append("> AI生成，不构成投资建议。股市有风险，投资需谨慎。")
         if watch_list:
             lines.append("")
             names = "、".join(f"{r.name}（{r.symbol}）" for r in watch_list[:3])

@@ -17,6 +17,7 @@ logger = setup_logging()
 
 DEFAULT_PLUGIN_CONFIG: dict[str, Any] = {
     "prefer_kimi_api": True,
+    "image_tables_enabled": True,
 }
 
 
@@ -104,6 +105,9 @@ def _migrate_data_files(old_data_dir: Path, new_data_dir: Path) -> None:
 
     迁移列表包括：Kimi OAuth 凭证、SQLite 数据库、自选股池、插件配置。
     仅当新目录不存在同名文件时才执行迁移，避免覆盖。
+
+    另外会将旧数据目录 ``strategies/`` 下的固定策略文件（选股策略_*.json）
+    同步到新目录，详见 :func:`_migrate_strategies_dir`。
     """
     files_to_migrate = [
         "kimi_api_credentials.json",
@@ -121,6 +125,39 @@ def _migrate_data_files(old_data_dir: Path, new_data_dir: Path) -> None:
                 logger.info(f"已迁移数据文件：{old_path} -> {new_path}")
             except OSError as exc:
                 logger.warning(f"迁移数据文件 {file_name} 失败：{exc}")
+    _migrate_strategies_dir(old_data_dir, new_data_dir)
+
+
+def _migrate_strategies_dir(old_data_dir: Path, new_data_dir: Path) -> None:
+    """将旧数据目录 ``strategies/`` 下的固定策略文件迁移到新数据目录。
+
+    策略文件属于插件随包配置，与凭证/自选股池等用户数据不同：
+    插件包内的版本视为权威版本，启动时覆盖同名文件，保证插件更新后策略同步更新；
+    内容完全一致的文件会跳过以避免无意义写入；
+    用户在插件数据目录中自行新增的策略文件不受影响。
+
+    Args:
+        old_data_dir: 插件包内的数据目录（插件根目录/data）。
+        new_data_dir: AstrBot 插件数据目录（data/plugin_data/outluna）。
+    """
+    old_strategies = old_data_dir / "strategies"
+    if not old_strategies.exists():
+        return
+    new_strategies = new_data_dir / "strategies"
+    try:
+        new_strategies.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logger.warning(f"创建策略目录 {new_strategies} 失败：{exc}")
+        return
+    for old_path in sorted(old_strategies.glob("*.json")):
+        new_path = new_strategies / old_path.name
+        try:
+            if new_path.exists() and new_path.read_bytes() == old_path.read_bytes():
+                continue
+            shutil.copy2(old_path, new_path)
+            logger.info(f"已迁移策略文件：{old_path} -> {new_path}")
+        except OSError as exc:
+            logger.warning(f"迁移策略文件 {old_path.name} 失败：{exc}")
 
 
 def _migrate_kimi_credentials(old_data_dir: Path, new_data_dir: Path) -> None:
@@ -137,4 +174,3 @@ def _migrate_kimi_credentials(old_data_dir: Path, new_data_dir: Path) -> None:
             logger.info(f"已迁移 Kimi 凭证：{old_cred} -> {new_cred}")
         except OSError as exc:
             logger.warning(f"迁移 Kimi 凭证失败：{exc}")
-

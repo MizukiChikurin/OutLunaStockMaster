@@ -20,8 +20,10 @@ def main():
         print("  list    - 列出策略")
         print("  scan    - 策略扫描")
         print("  select  - 超短线风控选股")
+        print("  fixed   - 固定策略选股")
         print("  analyze - 分析股票")
         print("  reports - 列出报告")
+        print("  track   - 追踪自选股池")
         print("  quit    - 退出")
 
         while True:
@@ -41,12 +43,20 @@ def main():
                     print(await engine.scan(strategy))
                 elif action == "select":
                     requirements = " ".join(parts[1:]) if len(parts) > 1 else ""
-                    print(await engine.select_stocks(requirements))
+                    result = await engine.select_stocks(requirements)
+                    print(result.text)
+                elif action == "fixed":
+                    preset_name = parts[1] if len(parts) > 1 else ""
+                    result = await engine.select_stocks_by_preset(preset_name)
+                    print(result.text)
                 elif action == "analyze":
                     symbol = parts[1] if len(parts) > 1 else "600519"
                     print(await engine.analyze(symbol))
                 elif action == "reports":
                     print(await engine.list_reports())
+                elif action == "track":
+                    result = await engine.track_watchlist()
+                    print(result.text)
                 else:
                     print(f"未知命令：{action}")
             except Exception as exc:
